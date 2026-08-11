@@ -21,14 +21,6 @@
 #define MAX_NAME 64
 #define PAGEC 2048
 
-struct func {
-    char name[MAX_NAME];
-    size_t offsets[LINKS / 2];
-    size_t count;
-};
-
-struct func funcs[FUNCS] = {0};
-
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) { return vfprintf(stderr, format, args); }
 
@@ -36,15 +28,17 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
+size_t offs[LINKS / 2] = {0};
+
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     const struct event *e = (const struct event *)data;
-    printf("%s %s on cpu=%d\n", e->is_exit ? "EXIT" : "ENTER", funcs[e->key].name, cpu);
+    printf("%s 0x%"PRIx32" on cpu=%d\n", e->is_exit ? "EXIT" : "ENTER", e->key, cpu);
 }
 
 int main(int argc, char **argv) {
     // read offsets from file
     if (argc != 2) {
-        fprintf(stderr, "usage: %s funcs.conf\n", argv[0]);
+        fprintf(stderr, "usage: %s offs.conf\n", argv[0]);
         return 1;
     }
     FILE *fp = fopen(argv[1], "r");
@@ -53,16 +47,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     char line[MAX_LINE], *token;
-    size_t funci = 0;
-    while (funci < FUNCS && fgets(line, sizeof(line), fp)) {
+    size_t oi = 0;
+    if (fgets(line, sizeof(line), fp)) {
         line[strcspn(line, "\r\n")] = '\0';
         token = strtok(line, " \t");
-        if (!token) break;
-        strncpy(funcs[funci].name, token, MAX_NAME - 1);
-        funcs[funci].name[MAX_NAME - 1] = '\0';
-        while ((token = strtok(NULL, " \t")) && funcs[funci].count < LINKS / 2)
-            funcs[funci].offsets[funcs[funci].count++] = strtoul(token, NULL, 0);
-        funci++;
+        while (token && oi < LINKS / 2) {
+            offs[oi++] = strtoul(token, NULL, 0);
+            token = strtok(NULL, " \t");
+        }
     }
     fclose(fp);
 
@@ -93,27 +85,22 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    for (size_t i = 0, j = 0; i < funci; i++) {
-        DECLARE_LIBBPF_OPTS(bpf_uprobe_opts, opts, .bpf_cookie = i);
-        for (size_t k = 0; k < funcs[i].count && j < LINKS / 2; k++, j++) {
-            // counter + entry
-            opts.retprobe = false;
-            links[2*j] = bpf_program__attach_uprobe_opts(
-                skel->progs.do_uprobe, -1, BINARY, funcs[i].offsets[k], &opts);
-            if (!links[2*j]) {
-                fprintf(stderr, "%s: Failed to attach uprobe\n", funcs[i].name);
-                err = -1;
-                goto cleanup;
-            }
-            // exit
-            opts.retprobe = true;
-            links[2*j+1] = bpf_program__attach_uprobe_opts(
-                skel->progs.do_uretprobe, -1, BINARY, funcs[i].offsets[k], &opts);
-            if (!links[2*j+1]) {
-                fprintf(stderr, "%s: Failed to attach uretprobe\n", funcs[i].name);
-                err = -1;
-                goto cleanup;
-            }
+    for (size_t i = 0; i < oi; i++) {
+        // counter + entry
+        links[2*i] = bpf_program__attach_uprobe(
+            skel->progs.do_uprobe, false, -1, BINARY, offs[i]);
+        if (!links[2*i]) {
+            fprintf(stderr, "%zu: Failed to attach uprobe\n", offs[i]);
+            err = -1;
+            goto cleanup;
+        }
+        // exit
+        links[2*i+1] = bpf_program__attach_uprobe(
+            skel->progs.do_uretprobe, true, -1, BINARY, offs[i]);
+        if (!links[2*i+1]) {
+            fprintf(stderr, "%zu: Failed to attach uretprobe\n", offs[i]);
+            err = -1;
+            goto cleanup;
         }
     }
 
@@ -127,14 +114,14 @@ int main(int argc, char **argv) {
 
 cleanup:
     puts("---------<function call counts>---------");
-    for (uint32_t key = 0; key < funci; key++) {
+    __u32 key = {};
+    while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0)
         if (bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
                                  counts, round_up(sizeof(__u64), 8) * ncpus, 0) == 0) {
             tcount = 0;
-            for (int cpui = 0; cpui < ncpus; cpui++) tcount += counts[cpui];
-            printf("%s: %lu\n", funcs[key].name, tcount);
+            for (size_t i = 0; i < ncpus; i++) tcount += counts[i];
+            printf("0x%"PRIx32": %lu\n", key, tcount);
         }
-    }
     for (size_t i = 0; i < LINKS && links[i]; i++) bpf_link__destroy(links[i]);
     if (pb) perf_buffer__free(pb);
     uprobe_bpf__destroy(skel);
