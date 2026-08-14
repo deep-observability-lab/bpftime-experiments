@@ -17,9 +17,10 @@
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
 #define BINARY "/usr/local/bin/dpdk-testpmd"
 #define LINKS 1024
-#define MAX_LINE 4096
-#define MAX_NAME 64
+#define MAX_LINE 2048
+#define MAX_NAME 256
 #define PAGEC 2048
+#define MAX_PATH 128
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) { return vfprintf(stderr, format, args); }
@@ -28,11 +29,13 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
-size_t offs[LINKS / 2] = {0};
+uint64_t base;
+FILE *fp;
 
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     const struct event *e = (const struct event *)data;
-    printf("%s 0x%"PRIx32" on cpu=%d\n", e->is_exit ? "EXIT" : "ENTER", e->key, cpu);
+    fprintf(fp, "%s 0x%"PRIx32" on cpu=%d\n",
+            e->is_exit ? "EXIT " : "ENTER", e->key - (uint32_t)base, cpu);
 }
 
 int main(int argc, char **argv) {
@@ -41,13 +44,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s offs.conf\n", argv[0]);
         return 1;
     }
-    FILE *fp = fopen(argv[1], "r");
+    fp = fopen(argv[1], "r");
     if (!fp) {
-        perror("fopen");
+        fprintf(stderr, "failed to fopen offs.conf\n");
         return 1;
     }
     char line[MAX_LINE], *token;
-    size_t oi = 0;
+    size_t oi = 0, offs[LINKS / 2] = {0};
     if (fgets(line, sizeof(line), fp)) {
         line[strcspn(line, "\r\n")] = '\0';
         token = strtok(line, " \t");
@@ -58,12 +61,6 @@ int main(int argc, char **argv) {
     }
     fclose(fp);
 
-    struct uprobe_bpf *skel;
-    struct bpf_link *links[LINKS] = {0};
-    int err, ncpus = libbpf_num_possible_cpus();
-    uint64_t counts[ncpus], tcount;
-    struct perf_buffer *pb;
-
     /* Set up libbpf errors and debug info callback */
     libbpf_set_print(libbpf_print_fn);
 
@@ -72,16 +69,60 @@ int main(int argc, char **argv) {
     signal(SIGTERM, sig_handler);
 
     /* Load and verify BPF application */
-    skel = uprobe_bpf__open();
+    struct uprobe_bpf *skel = uprobe_bpf__open();
     if (!skel) {
-        fprintf(stderr, "Failed to open and load BPF skeleton\n");
+        fprintf(stderr, "failed to open and load BPF skeleton\n");
         return 1;
+    }
+
+    struct bpf_link *links[LINKS] = {0};
+    int pid, err, ncpus = libbpf_num_possible_cpus();
+    uint32_t key = {};
+    uint64_t counts[ncpus], tcount;
+    struct perf_buffer *pb;
+
+    // find pid
+    fp = popen("pidof dpdk-testpmd", "r");
+    if (!fp) {
+        fprintf(stderr, "popen failed\n");
+        err = -1;
+        goto cleanup;
+    }
+    if (fscanf(fp, "%d", &pid) != 1) {
+        fprintf(stderr, "pid not found\n");
+        pclose(fp);
+        err = -1;
+        goto cleanup;
+    }
+    pclose(fp);
+
+    // get binary base
+    char path[MAX_PATH], filename[MAX_NAME];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "failed to fopen /proc/maps\n");
+        return 1;
+    }
+    err = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        // format: address perms offset dev inode filename
+        if (sscanf(line, "%lx-%*x %*s %*s %*s %*d %255s", &base, filename) == 2
+            && strcmp(filename, BINARY) == 0) {
+            err = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    if (err) {
+        fprintf(stderr, "bin base not found\n");
+        goto cleanup;
     }
 
     /* Load & verify BPF programs */
     err = uprobe_bpf__load(skel);
     if (err) {
-        fprintf(stderr, "Failed to load and verify BPF skeleton\n");
+        fprintf(stderr, "failed to load and verify BPF skeleton\n");
         goto cleanup;
     }
 
@@ -90,7 +131,7 @@ int main(int argc, char **argv) {
         links[2*i] = bpf_program__attach_uprobe(
             skel->progs.do_uprobe, false, -1, BINARY, offs[i]);
         if (!links[2*i]) {
-            fprintf(stderr, "%zu: Failed to attach uprobe\n", offs[i]);
+            fprintf(stderr, "%zu: failed to attach uprobe\n", offs[i]);
             err = -1;
             goto cleanup;
         }
@@ -98,7 +139,7 @@ int main(int argc, char **argv) {
         links[2*i+1] = bpf_program__attach_uprobe(
             skel->progs.do_uretprobe, true, -1, BINARY, offs[i]);
         if (!links[2*i+1]) {
-            fprintf(stderr, "%zu: Failed to attach uretprobe\n", offs[i]);
+            fprintf(stderr, "%zu: failed to attach uretprobe\n", offs[i]);
             err = -1;
             goto cleanup;
         }
@@ -107,22 +148,41 @@ int main(int argc, char **argv) {
     pb = perf_buffer__new(bpf_map__fd(skel->maps.events), PAGEC, handle_event, NULL, NULL, NULL);
     if (!pb) {
         fprintf(stderr, "perf_buffer__new failed\n");
+        err = -1;
+        goto cleanup;
+    }
+
+    fp = fopen("pevents.txt", "w");
+    if (!fp) {
+        fprintf(stderr, "failed to open pevents.txt\n");
+        err = -1;
         goto cleanup;
     }
 
     while (!exiting) perf_buffer__poll(pb, 100);
 
-cleanup:
-    puts("---------<function call counts>---------");
-    __u32 key = {};
+    fclose(fp);
+
+    fp = fopen("fcounts.txt", "w");
+    if (!fp) {
+        fprintf(stderr, "failed to open fcounts.txt\n");
+        err = -1;
+        goto cleanup;
+    }
     while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0)
         if (bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
                                  counts, round_up(sizeof(__u64), 8) * ncpus, 0) == 0) {
             tcount = 0;
             for (size_t i = 0; i < ncpus; i++) tcount += counts[i];
-            printf("0x%"PRIx32": %lu\n", key, tcount);
+            fprintf(fp, "0x%"PRIx32": %lu\n", key - (uint32_t)base, tcount);
         }
-    for (size_t i = 0; i < LINKS && links[i]; i++) bpf_link__destroy(links[i]);
+    fclose(fp);
+
+cleanup:
+    for (size_t i = 0; i < LINKS && links[i]; i+=2) {
+        bpf_link__destroy(links[i]);
+        bpf_link__destroy(links[i+1]);
+    }
     if (pb) perf_buffer__free(pb);
     uprobe_bpf__destroy(skel);
     return err < 0 ? -err : 0;
