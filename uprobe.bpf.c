@@ -5,7 +5,7 @@
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 32);
+    __uint(max_entries, FUNC);
     __type(key, __u32);
     __type(value, __u64);
 } counters SEC(".maps");
@@ -19,23 +19,20 @@ struct {
 
 SEC("uprobe")
 int do_uprobe(struct pt_regs *ctx) {
-    struct event e = {};
-    e.key = (__u32)PT_REGS_IP(ctx);
+    // added LSB specifies entry (0) or exit (1)
+    __u32 key = (__u32)(PT_REGS_IP(ctx) << 1);
     __u64 init = 1;
-    __u64 *val = bpf_map_lookup_elem(&counters, &e.key);
+    __u64 *val = bpf_map_lookup_elem(&counters, &key);
     if (val) (*val)++;
-    else bpf_map_update_elem(&counters, &e.key, &init, BPF_ANY);
-    e.is_exit = 0;
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
     return 0;
 }
 
 SEC("uretprobe")
 int do_uretprobe(struct pt_regs *ctx) {
-    struct event e = {};
-    e.key = (__u32)PT_REGS_IP(ctx);
-    e.is_exit = 1;
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &e, sizeof(e));
+    __u32 key = (__u32)((PT_REGS_IP(ctx) << 1) | 1);
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
     return 0;
 }
 

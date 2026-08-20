@@ -1,9 +1,10 @@
 #ifndef UPROBE_H
 #define UPROBE_H
 
-struct event {
-    __u32 key;
-    __u8 is_exit;
-};
+#define BINARY   "/usr/local/bin/dpdk-testpmd"
+#define REVF     "revents.txt"
+#define RCOUF    "rcounts.txt"
+#define MAX_LINE 1024
+#define FUNC     32
 
 #endif

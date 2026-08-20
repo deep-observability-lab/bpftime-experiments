@@ -13,14 +13,11 @@
 #include <inttypes.h>
 #include "uprobe.h"
 
-#define warn(...) fprintf(stderr, __VA_ARGS__)
+#define warn(...)      fprintf(stderr, __VA_ARGS__)
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
-#define BINARY "/usr/local/bin/dpdk-testpmd"
+
 #define LINKS 1024
-#define MAX_LINE 2048
-#define MAX_NAME 256
 #define PAGEC 2048
-#define MAX_PATH 128
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) { return vfprintf(stderr, format, args); }
@@ -29,13 +26,11 @@ static volatile bool exiting = false;
 
 static void sig_handler(int sig) { exiting = true; }
 
-uint64_t base;
 FILE *fp;
 
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
-    const struct event *e = (const struct event *)data;
-    fprintf(fp, "%s 0x%"PRIx32" on cpu=%d\n",
-            e->is_exit ? "EXIT " : "ENTER", e->key - (uint32_t)base, cpu);
+    fwrite(data, sizeof(uint32_t), 1, fp);
+    fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
 
 int main(int argc, char **argv) {
@@ -51,7 +46,7 @@ int main(int argc, char **argv) {
     }
     char line[MAX_LINE], *token;
     size_t oi = 0, offs[LINKS / 2] = {0};
-    if (fgets(line, sizeof(line), fp)) {
+    if (fgets(line, MAX_LINE, fp)) {
         line[strcspn(line, "\r\n")] = '\0';
         token = strtok(line, " \t");
         while (token && oi < LINKS / 2) {
@@ -76,48 +71,10 @@ int main(int argc, char **argv) {
     }
 
     struct bpf_link *links[LINKS] = {0};
-    int pid, err, ncpus = libbpf_num_possible_cpus();
+    int err, ncpus = libbpf_num_possible_cpus();
     uint32_t key = {};
     uint64_t counts[ncpus], tcount;
     struct perf_buffer *pb;
-
-    // find pid
-    fp = popen("pidof dpdk-testpmd", "r");
-    if (!fp) {
-        fprintf(stderr, "popen failed\n");
-        err = -1;
-        goto cleanup;
-    }
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fprintf(stderr, "pid not found\n");
-        pclose(fp);
-        err = -1;
-        goto cleanup;
-    }
-    pclose(fp);
-
-    // get binary base
-    char path[MAX_PATH], filename[MAX_NAME];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    fp = fopen(path, "r");
-    if (!fp) {
-        fprintf(stderr, "failed to fopen /proc/maps\n");
-        return 1;
-    }
-    err = -1;
-    while (fgets(line, sizeof(line), fp)) {
-        // format: address perms offset dev inode filename
-        if (sscanf(line, "%lx-%*x %*s %*s %*s %*d %255s", &base, filename) == 2
-            && strcmp(filename, BINARY) == 0) {
-            err = 0;
-            break;
-        }
-    }
-    fclose(fp);
-    if (err) {
-        fprintf(stderr, "bin base not found\n");
-        goto cleanup;
-    }
 
     /* Load & verify BPF programs */
     err = uprobe_bpf__load(skel);
@@ -152,9 +109,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    fp = fopen("pevents.txt", "w");
+    fp = fopen(REVF, "wb");
     if (!fp) {
-        fprintf(stderr, "failed to open pevents.txt\n");
+        fprintf(stderr, "failed to open revents.txt\n");
         err = -1;
         goto cleanup;
     }
@@ -163,18 +120,19 @@ int main(int argc, char **argv) {
 
     fclose(fp);
 
-    fp = fopen("fcounts.txt", "w");
+    fp = fopen(RCOUF, "wb");
     if (!fp) {
-        fprintf(stderr, "failed to open fcounts.txt\n");
+        fprintf(stderr, "failed to open rcounts.txt\n");
         err = -1;
         goto cleanup;
     }
     while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0)
         if (bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
-                                 counts, round_up(sizeof(__u64), 8) * ncpus, 0) == 0) {
+                                 counts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
             tcount = 0;
             for (size_t i = 0; i < ncpus; i++) tcount += counts[i];
-            fprintf(fp, "0x%"PRIx32": %lu\n", key - (uint32_t)base, tcount);
+            fwrite(&key, sizeof(uint32_t), 1, fp);
+            fwrite(&tcount, sizeof(uint64_t), 1, fp);
         }
     fclose(fp);
 
