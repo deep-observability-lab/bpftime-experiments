@@ -1,128 +1,93 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdlib.h>
 #include "uprobe.h"
 
-#define MAX_PATH 64
-#define MAX_NAME 256
-#define MAX_CMD  64
+#define MAX_NAME 64
 
 typedef struct {
     uint32_t key;
     char name[MAX_NAME];
-} cache_entry;
+} map;
 
-static cache_entry cache[FUNC];
-static uint8_t clen = 0;
-
-int main() {
-    // find pid
-    FILE *fp = popen("pidof dpdk-testpmd", "r");
+int main(int argc, char **argv) {
+    // read mappings from input file
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s [input]\n", argv[0]);
+        return 1;
+    }
+    FILE *fp = fopen(argv[1], "r");
     if (!fp) {
-        fprintf(stderr, "popen failed\n");
+        fprintf(stderr, "failed to fopen input file\n");
         return 1;
     }
-    int pid;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        fprintf(stderr, "pid not found\n");
-        pclose(fp);
-        return 1;
-    }
-    pclose(fp);
-
-    // get binary base
-    char path[MAX_PATH], name[MAX_NAME], line[MAX_LINE];
-    snprintf(path, MAX_PATH, "/proc/%d/maps", pid);
-    fp = fopen(path, "r");
-    if (!fp) {
-        fprintf(stderr, "failed to fopen /proc/maps\n");
-        return 1;
-    }
-    uint64_t base;
-    int err = 1;
-    while (fgets(line, MAX_LINE, fp)) {
-        // format: address perms offset dev inode filename
-        if (sscanf(line, "%lx-%*x %*s %*s %*s %*d %255s", &base, name) == 2
-            && strcmp(name, BINARY) == 0) {
-            err = 0;
-            break;
+    map maps[FUNC];
+    uint8_t mi = 0;
+    char line[MAX_LINE], name[MAX_NAME], *tok;
+    while (fgets(line, MAX_LINE, fp) && mi < FUNC) {
+        line[strcspn(line, "\r\n")] = '\0';
+        tok = strtok(line, " "); // name
+        if (!tok) continue;
+        strncpy(name, tok, MAX_NAME - 1);
+        name[MAX_NAME - 1] = '\0';
+        tok = strtok(NULL, " ");
+        while (tok && mi < FUNC) {
+            maps[mi].key = strtoul(tok, NULL, 0);
+            strncpy(maps[mi++].name, name, MAX_NAME);
+            tok = strtok(NULL, " ");
         }
     }
     fclose(fp);
-    if (err) {
-        fprintf(stderr, "bin base not found\n");
-        return 1;
-    }
 
-    fp = fopen(REVF, "rb");
-    if (!fp) {
-        fprintf(stderr, "failed to fopen revents.txt\n");
-        return 1;
-    }
-    uint32_t key, cpu;
-    char cmd[MAX_CMD];
-    FILE *pp;
-    // events
-    uint8_t exit;
-    uint8_t cached;
-    uint8_t ci;
-    while (fread(&key, sizeof(uint32_t), 1, fp) == 1
-           && fread(&cpu, sizeof(uint32_t), 1, fp) == 1) {
-        exit = key & 1;
-        key = (key - (uint32_t)(base << 1)) >> 1;
-        cached = 0;
-        for (uint8_t i = 0; i < clen; i++)
-            if (cache[i].key == key) {
-                cached = 1;
-                ci = i;
-                break;
-            }
-        if (!cached) {
-            snprintf(cmd, MAX_CMD, "addr2line -f -e %s 0x%x", BINARY, key);
-            pp = popen(cmd, "r");
-            if (!pp) {
-                fprintf(stderr, "addr2line failed at 0x%"PRIx32"\n", key);
-                continue;
-            }
-            if (!fgets(cache[clen].name, MAX_NAME, pp)) {
-                fprintf(stderr, "could not read function name at 0x%"PRIx32"\n", key);
-                pclose(pp);
-                continue;
-            }
-            pclose(pp);
-            cache[clen].name[strcspn(cache[clen].name, "\n")] = '\0';
-            cache[clen].key = key;
-            ci = clen++;
-        }
-        if (strcmp(cache[ci].name, "??") == 0) {
-            fprintf(stderr, "could not find function name at 0x%"PRIx32"\n", key);
-            continue;
-        }
-        printf("%s %s on cpu=%d\n", exit ? "EXIT " : "ENTER", cache[ci].name, cpu);
-    }
-    fclose(fp);
-
-    // counts
-    uint64_t count;
+    // base
     fp = fopen(RCOUF, "rb");
     if (!fp) {
         fprintf(stderr, "failed to fopen rcounts.txt\n");
         return 1;
     }
-    puts("\n----<function call counts>----");
-    while (fread(&key, sizeof(uint32_t), 1, fp) == 1
-           && fread(&count, sizeof(uint64_t), 1, fp) == 1) {
+    uint32_t base;
+    if (!fread(&base, sizeof(uint64_t), 1, fp)) {
+        fprintf(stderr, "could not read binary base from rcounts.txt");
+        return 1;
+    }
+
+    // counts
+    uint32_t key;
+    uint64_t count;
+    puts("----<function call counts>----");
+    while (fread(&key, sizeof(uint32_t), 1, fp) &&
+           fread(&count, sizeof(uint64_t), 1, fp)) {
         key = (key - (uint32_t)(base << 1)) >> 1;
-        for (uint8_t i = 0; i < clen; i++)
-            if (cache[i].key == key) {
-                if (strcmp(cache[ci].name, "??") == 0) {
-                    fprintf(stderr, "could not find function name at 0x%"PRIx32"\n", key);
-                    break;
-                }
-                printf("%s: %"PRIu64"\n", cache[i].name, count);
+        for (uint8_t i = 0; i < mi; i++) {
+            if (key == maps[i].key) {
+                printf("%s: %"PRIu64"\n", maps[i].name, count);
+                break;
+            }
+        }
+    }
+    fclose(fp);
+
+    // events
+    fp = fopen(REVF, "rb");
+    if (!fp) {
+        fprintf(stderr, "failed to fopen revents.txt\n");
+        return 1;
+    }
+    uint8_t exit;
+    uint32_t cpu;
+    puts("\n----<entry and exit events>----");
+    while (fread(&key, sizeof(uint32_t), 1, fp) == 1
+           && fread(&cpu, sizeof(uint32_t), 1, fp) == 1) {
+        exit = key & 1;
+        key = (key - (uint32_t)(base << 1)) >> 1;
+        for (uint8_t i = 0; i < mi; i++)
+            if (maps[i].key == key) {
+                printf("%s %s on cpu=%d\n", exit ? "EXIT " : "ENTER", maps[i].name, cpu);
                 break;
             }
     }
     fclose(fp);
+
     return 0;
 }

@@ -16,8 +16,11 @@
 #define warn(...)      fprintf(stderr, __VA_ARGS__)
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
 
-#define LINKS 1024
-#define PAGEC 2048
+#define BINARY   "/usr/local/bin/dpdk-testpmd"
+#define LINKS    1024
+#define PAGEC    2048
+#define MAX_PATH 64
+#define MAX_NAME 256
 
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
                            va_list args) { return vfprintf(stderr, format, args); }
@@ -34,27 +37,66 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
 }
 
 int main(int argc, char **argv) {
-    // read offsets from file
+    // read offsets from input file
     if (argc != 2) {
-        fprintf(stderr, "usage: %s offs.conf\n", argv[0]);
+        fprintf(stderr, "usage: %s [input]\n", argv[0]);
         return 1;
     }
     fp = fopen(argv[1], "r");
     if (!fp) {
-        fprintf(stderr, "failed to fopen offs.conf\n");
+        fprintf(stderr, "failed to fopen input file\n");
         return 1;
     }
-    char line[MAX_LINE], *token;
+    char line[MAX_LINE], *tok;
     size_t oi = 0, offs[LINKS / 2] = {0};
-    if (fgets(line, MAX_LINE, fp)) {
+    while (fgets(line, MAX_LINE, fp) && oi < LINKS / 2) {
         line[strcspn(line, "\r\n")] = '\0';
-        token = strtok(line, " \t");
-        while (token && oi < LINKS / 2) {
-            offs[oi++] = strtoul(token, NULL, 0);
-            token = strtok(NULL, " \t");
+        tok = strtok(line, " "); // skip name
+        tok = strtok(NULL, " ");
+        while (tok && oi < LINKS / 2) {
+            offs[oi++] = strtoul(tok, NULL, 0);
+            tok = strtok(NULL, " ");
         }
     }
     fclose(fp);
+
+    // find pid
+    FILE *fp = popen("pidof dpdk-testpmd", "r");
+    if (!fp) {
+        fprintf(stderr, "popen failed\n");
+        return 1;
+    }
+    int pid;
+    if (fscanf(fp, "%d", &pid) != 1) {
+        fprintf(stderr, "pid not found\n");
+        pclose(fp);
+        return 1;
+    }
+    pclose(fp);
+
+    // get binary base
+    char path[MAX_PATH], name[MAX_NAME];
+    snprintf(path, MAX_PATH, "/proc/%d/maps", pid);
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "failed to fopen /proc/maps\n");
+        return 1;
+    }
+    uint64_t base;
+    int err = 1;
+    while (fgets(line, MAX_LINE, fp)) {
+        // format: address perms offset dev inode filename
+        if (sscanf(line, "%lx-%*x %*s %*s %*s %*d %255s", &base, name) == 2
+            && strcmp(name, BINARY) == 0) {
+            err = 0;
+            break;
+        }
+    }
+    fclose(fp);
+    if (err) {
+        fprintf(stderr, "bin base not found\n");
+        return 1;
+    }
 
     /* Set up libbpf errors and debug info callback */
     libbpf_set_print(libbpf_print_fn);
@@ -71,7 +113,7 @@ int main(int argc, char **argv) {
     }
 
     struct bpf_link *links[LINKS] = {0};
-    int err, ncpus = libbpf_num_possible_cpus();
+    int ncpus = libbpf_num_possible_cpus();
     uint32_t key = {};
     uint64_t counts[ncpus], tcount;
     struct perf_buffer *pb;
@@ -126,8 +168,10 @@ int main(int argc, char **argv) {
         err = -1;
         goto cleanup;
     }
-    while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0)
-        if (bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
+    // also write binary base to rcounts.txt
+    fwrite(&base, sizeof(uint64_t), 1, fp);
+    while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0
+           && bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
                                  counts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
             tcount = 0;
             for (size_t i = 0; i < ncpus; i++) tcount += counts[i];
