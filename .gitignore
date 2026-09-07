@@ -1,0 +1,4 @@
+.output/
+uprobe
+post
+*.txt
