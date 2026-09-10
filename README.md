@@ -5,5 +5,5 @@ TODO:
 
 - [x] add post-process
 - [x] enhance performance of post-process
-- [ ] trace function arguments
+- [x] trace function arguments
 - [ ] conditional tracing based on function arguments
