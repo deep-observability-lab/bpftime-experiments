@@ -9,14 +9,16 @@
 #include <bpf/bpf.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include "uprobe.skel.h"
 #include <inttypes.h>
+#include <arpa/inet.h>
+#include "uprobe.skel.h"
 #include "uprobe.h"
 
 #define warn(...)      fprintf(stderr, __VA_ARGS__)
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
 
 #define BINARY   "/usr/local/bin/dpdk-testpmd"
+#define CONF     "funcs.conf"
 #define LINKS    1024
 #define PAGEC    2048
 #define MAX_PATH 64
@@ -36,13 +38,38 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
 
+struct flow {
+    uint8_t  proto;
+    uint32_t saddr;
+    uint32_t daddr;
+    uint16_t sport;
+    uint16_t dport;
+};
+
 int main(int argc, char **argv) {
-    // read offsets from input file
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s [input]\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr,
+                "usage: %s proto src_addr dst_addr src_port dst_port (use 0 as wildcard)\n",
+                argv[0]);
         return 1;
     }
-    fp = fopen(argv[1], "r");
+
+    struct flow tf = {0};
+    uint32_t key = {};
+
+    tf.proto = (uint8_t)atoi(argv[1]);
+
+    if (strcmp(argv[2], "0") != 0)
+        inet_pton(AF_INET, argv[2], &tf.saddr);
+
+    if (strcmp(argv[3], "0") != 0)
+        inet_pton(AF_INET, argv[3], &tf.daddr);
+
+    tf.sport = htons((uint16_t)atoi(argv[4]));
+    tf.dport = htons((uint16_t)atoi(argv[5]));
+
+    // read offsets from conf file
+    fp = fopen(CONF, "r");
     if (!fp) {
         fprintf(stderr, "failed to fopen input file\n");
         return 1;
@@ -114,7 +141,6 @@ int main(int argc, char **argv) {
 
     struct bpf_link *links[LINKS] = {0};
     int ncpus = libbpf_num_possible_cpus();
-    uint32_t key = {};
     uint64_t counts[ncpus], tcount;
     struct perf_buffer *pb;
 
@@ -122,6 +148,12 @@ int main(int argc, char **argv) {
     err = uprobe_bpf__load(skel);
     if (err) {
         fprintf(stderr, "failed to load and verify BPF skeleton\n");
+        goto cleanup;
+    }
+
+    if (bpf_map__update_elem(skel->maps.target,
+                             &key, sizeof(key), &tf, sizeof(tf), BPF_ANY) != 0) {
+        fprintf(stderr, "failed to pass target flow to eBPF\n");
         goto cleanup;
     }
 

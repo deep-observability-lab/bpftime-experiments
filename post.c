@@ -14,7 +14,7 @@ typedef struct {
 int main(int argc, char **argv) {
     // read mappings from input file
     if (argc != 2) {
-        fprintf(stderr, "usage: %s [input]\n", argv[0]);
+        fprintf(stderr, "usage: %s <function mappings file>\n", argv[0]);
         return 1;
     }
     FILE *fp = fopen(argv[1], "r");
@@ -40,7 +40,6 @@ int main(int argc, char **argv) {
     }
     fclose(fp);
 
-    // base
     fp = fopen(RCOUF, "rb");
     if (!fp) {
         fprintf(stderr, "failed to fopen rcounts.txt\n");
@@ -52,7 +51,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // counts
     uint32_t key;
     uint64_t count;
     puts("----<function call counts>----");
@@ -68,7 +66,6 @@ int main(int argc, char **argv) {
     }
     fclose(fp);
 
-    // events
     fp = fopen(REVF, "rb");
     if (!fp) {
         fprintf(stderr, "failed to fopen revents.txt\n");

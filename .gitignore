@@ -2,3 +2,4 @@
 uprobe
 post
 *.txt
+*.conf
