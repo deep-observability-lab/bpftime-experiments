@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
     }
 
     struct flow tf = {0};
-    uint32_t key = {};
+    uint32_t key = 0;
 
     tf.proto = (uint8_t)atoi(argv[1]);
 

@@ -4,12 +4,25 @@
 #include <stdlib.h>
 #include "uprobe.h"
 
-#define MAX_NAME 64
+#define MAX_NAME  64
+#define MAX_DEPTH 4096
+#define MAX_EDGE  FUNC * (FUNC - 1)
 
-typedef struct {
+struct map {
     uint32_t key;
     char name[MAX_NAME];
-} map;
+};
+
+struct stack {
+    uint32_t depth;
+    uint32_t addrs[MAX_DEPTH];
+};
+
+struct edge {
+    uint32_t caller;
+    uint32_t callee;
+    uint64_t count;
+};
 
 int main(int argc, char **argv) {
     // read mappings from input file
@@ -22,7 +35,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to fopen input file\n");
         return 1;
     }
-    map maps[FUNC];
+    struct map maps[FUNC];
     uint8_t mi = 0;
     char line[MAX_LINE], name[MAX_NAME], *tok;
     while (fgets(line, MAX_LINE, fp) && mi < FUNC) {
@@ -71,20 +84,63 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to fopen revents.txt\n");
         return 1;
     }
-    uint8_t exit;
-    uint32_t cpu;
+    uint8_t exit, exist;
+    uint32_t cpu, ei = 0;
+    struct stack st = {0};
+    struct edge e, edges[MAX_EDGE] = {0};
     puts("\n----<entry and exit events>----");
     while (fread(&key, sizeof(uint32_t), 1, fp) == 1
            && fread(&cpu, sizeof(uint32_t), 1, fp) == 1) {
         exit = key & 1;
         key = (key - (uint32_t)(base << 1)) >> 1;
+
+        if (exit) // remove from stack
+            st.depth--;
+
+        else { // is entry, create edge or increment count
+            e = (struct edge){ .caller = 0, .callee = key, .count = 1 };
+            if (st.depth > 0) // has caller
+                e.caller = st.addrs[st.depth - 1];
+
+            exist = 0;
+            for (uint32_t i = 0; i < ei; i++)
+                if (edges[i].caller == e.caller && edges[i].callee == e.callee) {
+                    exist = 1;
+                    edges[i].count++;
+                    break;
+                }
+
+            if (!exist)
+                edges[ei++] = e;
+
+            if (st.depth < MAX_DEPTH) // add on stack
+                st.addrs[st.depth++] = key;
+        }
+
         for (uint8_t i = 0; i < mi; i++)
             if (maps[i].key == key) {
-                printf("%s %s on cpu=%d\n", exit ? "EXIT " : "ENTER", maps[i].name, cpu);
+                printf("%s %s on cpu=%"PRIu32"\n",
+                       exit ? "EXIT " : "ENTER", maps[i].name, cpu);
                 break;
             }
     }
     fclose(fp);
+    
+    puts("\n----<function graph>----");
+    for (uint32_t i = 0; i < ei; i++) {
+        if (edges[i].caller == 0)
+            printf("*");
+        else for (uint8_t j = 0; j < mi; j++)
+            if (maps[j].key == edges[i].caller) {
+                printf("%s", maps[j].name);
+            }
+
+        for (uint8_t j = 0; j < mi; j++)
+            if (maps[j].key == edges[i].callee) {
+                printf(" --[%"PRIu64"]--> ", edges[i].count);
+                printf("%s\n", maps[j].name);
+            }
+    }
 
     return 0;
 }
