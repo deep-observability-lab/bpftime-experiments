@@ -3,6 +3,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <time.h>
+#include <string.h>
+#include <errno.h>
 #include <stdint.h>
 #include <sys/resource.h>
 #include <bpf/libbpf.h>
@@ -34,6 +36,8 @@ static void sig_handler(int sig) { exiting = true; }
 FILE *fp;
 
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
+    if (!fp) return;
+    if (!data || size < sizeof(uint32_t)) return;
     fwrite(data, sizeof(uint32_t), 1, fp);
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
@@ -60,10 +64,16 @@ int main(int argc, char **argv) {
     tf.proto = (uint8_t)atoi(argv[1]);
 
     if (strcmp(argv[2], "0") != 0)
-        inet_pton(AF_INET, argv[2], &tf.saddr);
+        if (inet_pton(AF_INET, argv[2], &tf.saddr) != 1) {
+            fprintf(stderr, "invalid source address: %s\n", argv[2]);
+            return 1;
+        }
 
     if (strcmp(argv[3], "0") != 0)
-        inet_pton(AF_INET, argv[3], &tf.daddr);
+        if (inet_pton(AF_INET, argv[3], &tf.daddr) != 1) {
+            fprintf(stderr, "invalid destination address: %s\n", argv[3]);
+            return 1;
+        }
 
     tf.sport = htons((uint16_t)atoi(argv[4]));
     tf.dport = htons((uint16_t)atoi(argv[5]));
@@ -81,14 +91,25 @@ int main(int argc, char **argv) {
         tok = strtok(line, " "); // skip name
         tok = strtok(NULL, " ");
         while (tok && oi < LINKS / 2) {
-            offs[oi++] = strtoul(tok, NULL, 0);
+            char *endp;
+            errno = 0;
+            size_t off = strtoul(tok, &endp, 0);
+            if (errno || endp == tok) {
+                fprintf(stderr, "invalid offset '%s' in %s\n", tok, CONF);
+                fclose(fp);
+                return 1;
+            }
+            offs[oi++] = off;
             tok = strtok(NULL, " ");
         }
     }
     fclose(fp);
-
+    if (oi == 0) {
+        fprintf(stderr, "no offsets found in %s\n", CONF);
+        return 1;
+    }
     // find pid
-    FILE *fp = popen("pidof dpdk-testpmd", "r");
+    fp = popen("pidof dpdk-testpmd", "r");
     if (!fp) {
         fprintf(stderr, "popen failed\n");
         return 1;
@@ -113,7 +134,7 @@ int main(int argc, char **argv) {
     int err = 1;
     while (fgets(line, MAX_LINE, fp)) {
         // format: address perms offset dev inode filename
-        if (sscanf(line, "%lx-%*x %*s %*s %*s %*d %255s", &base, name) == 2
+        if (sscanf(line, "%" SCNx64 "-%*x %*s %*s %*s %*d %255s", &base, name) == 2
             && strcmp(name, BINARY) == 0) {
             err = 0;
             break;
@@ -140,9 +161,25 @@ int main(int argc, char **argv) {
     }
 
     struct bpf_link *links[LINKS] = {0};
+    struct perf_buffer *pb = NULL;
+    uint64_t *counts = NULL, tcount;
+    int pret;
     int ncpus = libbpf_num_possible_cpus();
-    uint64_t counts[ncpus], tcount;
-    struct perf_buffer *pb;
+    if (ncpus <= 0) {
+        fprintf(stderr, "failed to get cpu count\n");
+        goto cleanup;
+    }
+
+    if (bpf_map__set_max_entries(skel->maps.events, ncpus) != 0) {
+        fprintf(stderr, "failed to resize events map to %d cpus\n", ncpus);
+        goto cleanup;
+    }
+
+    counts = malloc(round_up(sizeof(uint64_t), 8) * ncpus);
+    if (!counts) {
+        fprintf(stderr, "failed to allocate counts buffer\n");
+        goto cleanup;
+    }
 
     /* Load & verify BPF programs */
     err = uprobe_bpf__load(skel);
@@ -190,9 +227,16 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    while (!exiting) perf_buffer__poll(pb, 100);
+    while (!exiting) {
+        pret = perf_buffer__poll(pb, 100);
+        if (pret < 0 && pret != -EINTR) {
+            fprintf(stderr, "perf_buffer__poll failed: %d\n", pret);
+            break;
+        }
+    }
 
     fclose(fp);
+    fp = NULL;
 
     fp = fopen(RCOUF, "wb");
     if (!fp) {
@@ -215,7 +259,7 @@ int main(int argc, char **argv) {
 cleanup:
     for (size_t i = 0; i < LINKS && links[i]; i+=2) {
         bpf_link__destroy(links[i]);
-        bpf_link__destroy(links[i+1]);
+        if(links[i+1]) bpf_link__destroy(links[i+1]);
     }
     if (pb) perf_buffer__free(pb);
     uprobe_bpf__destroy(skel);

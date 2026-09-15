@@ -81,7 +81,7 @@ int do_uprobe(struct pt_regs *ctx) {
     }
 
     // added LSB specifies entry (0) or exit (1)
-    key = PT_REGS_IP(ctx) << 1;
+    key = (__u32)(PT_REGS_IP(ctx) << 1);
     __u64 init = 1, *val = bpf_map_lookup_elem(&counters, &key);
     if (val) (*val)++;
     else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
