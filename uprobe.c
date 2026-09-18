@@ -36,8 +36,7 @@ static void sig_handler(int sig) { exiting = true; }
 FILE *fp;
 
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
-    if (!fp) return;
-    if (!data || size < sizeof(uint32_t)) return;
+    if (!fp || !data || size < sizeof(uint32_t)) return;
     fwrite(data, sizeof(uint32_t), 1, fp);
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
@@ -64,13 +63,13 @@ int main(int argc, char **argv) {
     tf.proto = (uint8_t)atoi(argv[1]);
 
     if (strcmp(argv[2], "0") != 0)
-        if (inet_pton(AF_INET, argv[2], &tf.saddr) != 1) {
+        if (!inet_pton(AF_INET, argv[2], &tf.saddr)) {
             fprintf(stderr, "invalid source address: %s\n", argv[2]);
             return 1;
         }
 
     if (strcmp(argv[3], "0") != 0)
-        if (inet_pton(AF_INET, argv[3], &tf.daddr) != 1) {
+        if (!inet_pton(AF_INET, argv[3], &tf.daddr)) {
             fprintf(stderr, "invalid destination address: %s\n", argv[3]);
             return 1;
         }
@@ -84,16 +83,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to fopen input file\n");
         return 1;
     }
-    char line[MAX_LINE], *tok;
-    size_t oi = 0, offs[LINKS / 2] = {0};
+    char line[MAX_LINE], *tok, *endp;
+    size_t oi = 0, off, offs[LINKS / 2] = {0};
     while (fgets(line, MAX_LINE, fp) && oi < LINKS / 2) {
         line[strcspn(line, "\r\n")] = '\0';
         tok = strtok(line, " "); // skip name
         tok = strtok(NULL, " ");
         while (tok && oi < LINKS / 2) {
-            char *endp;
             errno = 0;
-            size_t off = strtoul(tok, &endp, 0);
+            off = strtoul(tok, &endp, 0);
             if (errno || endp == tok) {
                 fprintf(stderr, "invalid offset '%s' in %s\n", tok, CONF);
                 fclose(fp);
@@ -108,6 +106,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "no offsets found in %s\n", CONF);
         return 1;
     }
+
     // find pid
     fp = popen("pidof dpdk-testpmd", "r");
     if (!fp) {
@@ -153,6 +152,17 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    int ncpus = libbpf_num_possible_cpus();
+    if (ncpus <= 0) {
+        fprintf(stderr, "failed to get cpu count\n");
+        return 1;
+    }
+
+    uint64_t counts[ncpus], tcount;
+    struct bpf_link *links[LINKS] = {0};
+    struct perf_buffer *pb = NULL;
+    int pret;
+
     /* Load and verify BPF application */
     struct uprobe_bpf *skel = uprobe_bpf__open();
     if (!skel) {
@@ -160,22 +170,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    struct bpf_link *links[LINKS] = {0};
-    struct perf_buffer *pb = NULL;
-    uint64_t tcount;
-    int pret;
-    int ncpus = libbpf_num_possible_cpus();
-    if (ncpus <= 0) {
-        fprintf(stderr, "failed to get cpu count\n");
-        return 1;
-    }
-
     if (bpf_map__set_max_entries(skel->maps.events, ncpus) != 0) {
         fprintf(stderr, "failed to resize events map to %d cpus\n", ncpus);
-        return 1;
+        goto cleanup;
     }
 
-    u_int64_t counts[ncpus];
     /* Load & verify BPF programs */
     err = uprobe_bpf__load(skel);
     if (err) {

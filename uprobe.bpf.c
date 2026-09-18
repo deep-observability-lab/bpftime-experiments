@@ -36,7 +36,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(max_entries, 32);
+    __uint(max_entries, 32); // placeholder, will be updated by userspace
     __type(key, __u32);
     __type(value, __u32);
 } events SEC(".maps");
@@ -128,7 +128,7 @@ int do_uretprobe(struct pt_regs *ctx) {
         if (tf->dport != 0 && dport != tf->dport) return 0;
     }
 
-    key = (__u32)(PT_REGS_IP(ctx) << 1) | 1;
+    key = (__u32)((PT_REGS_IP(ctx) << 1) | 1);
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
     return 0;
 }

@@ -7,7 +7,7 @@
 
 #define MAX_NAME  64
 #define MAX_DEPTH 4096
-#define MAX_EDGE  FUNC ّ * (FUNC - 1) 
+#define MAX_EDGE  FUNC * (FUNC - 1)
 
 struct map {
     uint32_t key;
@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
     }
     struct map maps[FUNC] = {0};
     uint8_t mi = 0;
-    char line[MAX_LINE], name[MAX_NAME], *tok;
+    char line[MAX_LINE], name[MAX_NAME], *tok, *endp;
     while (fgets(line, MAX_LINE, fp) && mi < FUNC) {
         line[strcspn(line, "\r\n")] = '\0';
         tok = strtok(line, " "); // name
@@ -47,7 +47,6 @@ int main(int argc, char **argv) {
         name[MAX_NAME - 1] = '\0';
         tok = strtok(NULL, " ");
         while (tok && mi < FUNC) {
-            char *endp;
             errno = 0;
             maps[mi].key = strtoul(tok, &endp, 0);
             if (errno || endp == tok) {
@@ -55,9 +54,7 @@ int main(int argc, char **argv) {
                 fclose(fp);
                 return 1;
             }
-            strncpy(maps[mi].name, name, MAX_NAME);
-            maps[mi].name[MAX_NAME - 1] = '\0';
-            mi++;
+            strncpy(maps[mi++].name, name, MAX_NAME);
             tok = strtok(NULL, " ");
         }
     }
@@ -81,14 +78,8 @@ int main(int argc, char **argv) {
     uint32_t key;
     uint64_t count;
     puts("----<function call counts>----");
-    size_t rk, rc;
-    while ((rk = fread(&key, sizeof(uint32_t), 1, fp)) == 1) {
-        rc = fread(&count, sizeof(uint64_t), 1, fp);
-        if (rc != 1) {
-            fprintf(stderr, "warning: truncated record in rcounts.txt, ignoring\n");
-            break;
-        }
-
+    while (fread(&key, sizeof(uint32_t), 1, fp) &&
+           fread(&count, sizeof(uint64_t), 1, fp)) {
         key = (key - (uint32_t)(base << 1)) >> 1;
         for (uint8_t i = 0; i < mi; i++) {
             if (key == maps[i].key) {
@@ -114,9 +105,8 @@ int main(int argc, char **argv) {
         is_exit = key & 1;
         key = (key - (uint32_t)(base << 1)) >> 1;
 
-        if (is_exit) { // remove from stack
-            if (st.depth > 0) st.depth--;
-        }
+        if (is_exit && st.depth > 0) // remove from stack
+            st.depth--;
 
         else { // is entry, create edge or increment count
             e = (struct edge){ .caller = 0, .callee = key, .count = 1 };
@@ -131,13 +121,11 @@ int main(int argc, char **argv) {
                     break;
                 }
 
-            if (!exist) {
+            if (!exist)
                 edges[ei++] = e;
-            }
 
-            if (st.depth < MAX_DEPTH) { // add on stack
+            if (st.depth < MAX_DEPTH) // add on stack
                 st.addrs[st.depth++] = key;
-            }
             else {
                 fprintf(stderr, "call stack exceeded MAX_DEPTH (%d), aborting\n", MAX_DEPTH);
                 fclose(fp);
