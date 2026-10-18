@@ -31,7 +31,7 @@ The loader writes the raw results to two binary files. A separate **post-process
 bpftime-experiments/
 ├── README.md        # Description of the project (Current file) 
 ├── Makefile         # Builds libbpf, bpftool, the eBPF object, the skeleton, `uprobe` and `post` (set BPFTROOT first)
-├── uprobe.bpf.c     # eBPF programs: do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, maps
+├── uprobe.bpf.c     # eBPF programs: do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, per-thread entry/exit pairing, maps
 ├── uprobe.c         # libbpf loader: parses the filter args and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes output files
 ├── uprobe.h         # Shared constants: output file names (revents.txt, rcounts.txt), MAX_LINE, FUNC (=32)
 ├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, ENTER/EXIT trace and function graph
@@ -400,7 +400,7 @@ links[2*i+1] = bpf_program__attach_uprobe(skel->progs.do_uretprobe, true,  -1, B
 ```
 
 * `do_uprobe` (`SEC("uprobe")`) applies the filter, increments the counter and emits an **entry** event with key `IP<<1`.
-* `do_uretprobe` (`SEC("uretprobe")`) applies the **same filter**, re-reading `PT_REGS_PARM1` at return time. It emits an **exit** event with key `(IP<<1)|1`. It does not count.
+* `do_uretprobe` (`SEC("uretprobe")`) does **not** re-read the packet. It checks the per-thread record that do_uprobe left (section 3.8) and emits an **exit** event with key `(IP<<1)|1` only if the matching entry passed the filter. It does not count.
 
 The loader is a normal libbpf program. When it runs under `bpftime load`, bpftime's syscall server intercepts the BPF and perf-event syscalls, and the probes are installed in testpmd's userspace by the bpftime agent instead of the kernel.
 
@@ -426,6 +426,19 @@ bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
 ### 3.7 Experiment: post-processing (counts, trace, function graph)
 
 **File:** `post.c`. Details are in [section 5](#5-post-processing-and-interpreting-results).
+
+### 3.8 Per-thread entry/exit pairing (`tstates` map)
+
+**File:** `uprobe.bpf.c` (struct `tstate`, map `tstates`, helper `match()`).
+
+At return time the first-argument register no longer holds the mbuf, so the exit probe cannot re-run the filter. Instead, every thread keeps a small record, keyed by `bpf_get_current_pid_tgid()`:
+
+`struct tstate { __u32 depth; __u64 bits; }`;
+
+* **Entry:** take `d = depth`, then `depth = d + 1` (always, whether or not the filter passes). Bit `d` of `bits` is set to 1 if `match()` passes and cleared to 0 if it fails.
+* **Exit:** if `depth == 0`, ignore the event. Otherwise `d = depth - 1`, `depth = d`, and emit EXIT only if bit `d` is 1.
+
+Each nesting level has its own bit, so nested probed calls cannot overwrite each other's decisions. Every emitted EXIT now has a matching ENTER on the same thread.
 
 ---
 
@@ -619,7 +632,7 @@ rte_net_get_ptype: 85675
 * --[2689]--> pmd_tx_burst
 ```
 
-The filter keeps only the ns1 → ns2 TCP data packets, so the counts are lower than the total number of forwarded packets. In both runs, `pmd_rx_burst`, `pmd_tx_burst`, `pkt_burst_io_forward` and `rte_mbuf_raw_alloc` have no ENTER events, because their first argument is not an `rte_mbuf *` (limitation 1). The unmatched EXIT events come from the uretprobe re-reading `PT_REGS_PARM1` (limitation 2).
+The filter keeps only the ns1 → ns2 TCP data packets, so the counts are lower than the total number of forwarded packets. In both runs, `pmd_rx_burst`, `pmd_tx_burst`, `pkt_burst_io_forward` and `rte_mbuf_raw_alloc` have no ENTER events, because their first argument is not an `rte_mbuf *` (limitation 1). This sample was recorded before the per-thread pairing (section 3.8). The unmatched EXIT events in it came from the old uretprobe, and they no longer appear.
 
 ---
 
@@ -690,13 +703,13 @@ else {                         // is entry, create edge or increment count
 | Build cannot find `bpf/bpf_helpers.h` or the uapi headers | A **trailing slash** on `BPFTROOT` is recommended. The Makefile line `-I$(BPFTROOT)third_party/libbpf/include/uapi` has no `/` between the variable and `third_party`; without the slash, the bundled uapi include path is silently ignored and system headers are used. |
 | Build cannot find `vmlinux.h` / bpftool sources | Run `git submodule update --init --recursive` in the bpftime checkout. |
 | `rcounts.txt` empty or missing | The loader was killed with SIGKILL, or exited on an error. Counts are written only after a clean SIGINT/SIGTERM. |
-| `post`: `call stack exceeded MAX_DEPTH (4096), aborting` | Many ENTER events without matching EXIT events. See the uretprobe limitations below. |
+| `post`: `call stack exceeded MAX_DEPTH (4096), aborting` | Many ENTER events without matching EXIT events. Usually events were lost from the perf buffer, or the loader was stopped while many calls were still open. |
 | `post` prints nothing for some functions | Their first argument is not an mbuf (filtered out), or the mapping/offset does not match the decoded address. |
 
 ### 6.2 Known limitations
 
 1. **Every probed function is assumed to take `struct rte_mbuf *` as its first argument.** Many functions in `funcs.conf` do not, for example `rte_lcore_id`, `rte_constant_bswap16`, `rte_ipv4_hdr_len`, `rte_mbuf_raw_alloc`, `rte_eth_rx_burst`, `pmd_rx_burst`/`pmd_tx_burst`, `pkt_burst_io_forward` and `common_fwd_stream_transmit`. For those, the mbuf/packet reads fail or read garbage, the call is dropped, and it is **neither counted nor traced**.
-2. **The uretprobe re-reads `PT_REGS_PARM1` at function return.** The first-argument register is not preserved across a call, so exit events can be filtered out wrongly. That leaves the ENTER/EXIT trace and the function graph unbalanced.
+2. **Nesting and thread limits.** Each thread can have at most 64 probed calls open at once (one bit each in tstate.bits). Deeper calls are not traced. The tstates map holds up to 1024 threads, and entries are never removed. That is plenty for testpmd.
 3. **Exit address decoding.** `post` assumes that the IP seen in the uretprobe decodes to the same function offset as the entry. With kernel uretprobes, the IP at return is the caller's return address. Under bpftime v0.9.0, the exit-probe address decodes to the same function as the entry; this was verified in a test run.
 4. **Inlined call sites are invisible.** The `funcs.conf` offsets are real `FUNC` symbols (out-of-line LOCAL copies of `static inline` helpers, section 3.1.1), so they have a normal call and return. Calls that the compiler inlined into their caller have no symbol and are never probed, so counts cover only the out-of-line copies you listed.
 5. **Fixed packet layout:** untagged Ethernet + IPv4 with a 20-byte header (no IP options, no VLAN, no IPv6). Ports are read at fixed offsets 34/36. Only the first segment (`buf_addr + data_off`) is parsed.
