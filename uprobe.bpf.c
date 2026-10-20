@@ -12,14 +12,6 @@
 #define SPORT_OFFSET 34
 #define DPORT_OFFSET 36
 
-struct flow {
-    __u8   proto;
-    __be32 saddr;
-    __be32 daddr;
-    __be16 sport;
-    __be16 dport;
-};
-
 struct tstate {
     __u32 depth;   // how many probed calls this thread has open right now
     __u64 bits;    // bit i = 1 means the call at depth i passed the filter

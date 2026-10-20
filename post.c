@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <linux/types.h>
 #include "uprobe.h"
 
 #define MAX_NAME  64
