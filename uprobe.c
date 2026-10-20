@@ -1,22 +1,18 @@
-// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
-/* Copyright (c) 2020 Facebook */
+// SPDX-License-Identifier: BSD-2-Clause
+/* Copyright (c) 2026 Deepobservability */
 #include <signal.h>
 #include <stdio.h>
-#include <time.h>
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
-#include <sys/resource.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include "uprobe.skel.h"
 #include "uprobe.h"
 
-#define warn(...)      fprintf(stderr, __VA_ARGS__)
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
 
 #define BINARY   "/usr/local/bin/dpdk-testpmd"
