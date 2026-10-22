@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include "uprobe.skel.h"
+#include <linux/types.h>
 #include "uprobe.h"
 
 #define round_up(x, y) ((((x) + ((y) - 1)) / (y)) * (y))
@@ -36,14 +37,6 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     fwrite(data, sizeof(uint32_t), 1, fp);
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
-
-struct flow {
-    uint8_t  proto;
-    uint32_t saddr;
-    uint32_t daddr;
-    uint16_t sport;
-    uint16_t dport;
-};
 
 int main(int argc, char **argv) {
     if (argc != 6) {

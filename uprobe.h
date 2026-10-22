@@ -6,4 +6,12 @@
 #define MAX_LINE 1024
 #define FUNC     32
 
+struct flow {
+    __u8   proto;
+    __be32 saddr;
+    __be32 daddr;
+    __be16 sport;
+    __be16 dport;
+};
+
 #endif
