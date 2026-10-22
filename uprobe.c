@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause
 /* Copyright (c) 2026 Deepobservability */
+/* Copyright (c) 2020 Facebook */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
