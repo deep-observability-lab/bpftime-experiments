@@ -8,7 +8,7 @@
 
 #define MAX_NAME  64
 #define MAX_DEPTH 4096
-#define MAX_EDGE  FUNC * (FUNC - 1)
+#define MAX_EDGE  (FUNC * (FUNC - 1))
 
 struct map {
     uint32_t key;
@@ -25,6 +25,40 @@ struct edge {
     uint32_t callee;
     uint64_t count;
 };
+
+const char* get_name(uint32_t key, struct map *maps, uint8_t mi) {
+    for (uint8_t i = 0; i < mi; i++) {
+        if (maps[i].key == key) return maps[i].name;
+    }
+    return "unknown";
+}
+
+void print_tree(uint32_t current_caller, struct map *maps, uint8_t mi, struct edge *edges, uint32_t ei, int depth) {
+    for (uint32_t i = 0; i < ei; i++) {
+        if (edges[i].caller == current_caller) {
+            for (int d = 0; d < depth; d++) {
+                if (d == depth - 1) printf(" └── ");
+                else printf("    ");
+            }
+
+            const char *callee_name = get_name(edges[i].callee, maps, mi);
+            printf("%s (%.llu)\n", callee_name, (unsigned long long)edges[i].count);
+
+            print_tree(edges[i].callee, maps, mi, edges, ei, depth + 1);
+        }
+    }
+}
+
+void print_graph(struct map *maps, uint8_t mi, struct edge *edges, uint32_t ei) {
+    for (uint32_t i = 0; i < ei; i++) {
+        if (edges[i].caller == 0) {
+            puts("");
+            const char *root_name = get_name(edges[i].callee, maps, mi);
+            printf(" %s (%.llu)\n", root_name, (unsigned long long)edges[i].count);
+            print_tree(edges[i].callee, maps, mi, edges, ei, 1);
+        }
+    }
+}
 
 int main(int argc, char **argv) {
     // read mappings from input file
@@ -78,13 +112,15 @@ int main(int argc, char **argv) {
 
     uint32_t key;
     uint64_t count;
-    puts("----<function call counts>----");
+    printf("%-35s | %-15s\n", "function", "calls");
+    printf("--------------------------------------------------\n");
+
     while (fread(&key, sizeof(uint32_t), 1, fp) &&
-           fread(&count, sizeof(uint64_t), 1, fp)) {
+               fread(&count, sizeof(uint64_t), 1, fp)) {
         key = (key - (uint32_t)(base << 1)) >> 1;
         for (uint8_t i = 0; i < mi; i++) {
             if (key == maps[i].key) {
-                printf("%s: %"PRIu64"\n", maps[i].name, count);
+                printf("%-35s | %" PRIu64 "\n", maps[i].name, count);
                 break;
             }
         }
@@ -142,22 +178,9 @@ int main(int argc, char **argv) {
             }
     }
     fclose(fp);
-    
-    puts("\n----<function graph>----");
-    for (uint32_t i = 0; i < ei; i++) {
-        if (edges[i].caller == 0)
-            printf("*");
-        else for (uint8_t j = 0; j < mi; j++)
-            if (maps[j].key == edges[i].caller) {
-                printf("%s", maps[j].name);
-            }
 
-        for (uint8_t j = 0; j < mi; j++)
-            if (maps[j].key == edges[i].callee) {
-                printf(" --[%"PRIu64"]--> ", edges[i].count);
-                printf("%s\n", maps[j].name);
-            }
-    }
+    puts("\n----<function graph>----");
+    print_graph(maps, mi, edges, ei);
 
     return 0;
 }
