@@ -178,8 +178,26 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    for (size_t i = 0; i < oi; i++) {
-        // counter + entry
+    // attach to filter
+    // counter + entry
+    links[0] = bpf_program__attach_uprobe(
+        skel->progs.do_uprobe_match, false, -1, BINARY, offs[0]);
+    if (!links[0]) {
+        fprintf(stderr, "%zu: failed to attach uprobe\n", offs[0]);
+        err = -1;
+        goto cleanup;
+    }
+    // exit
+    links[1] = bpf_program__attach_uprobe(
+        skel->progs.do_uretprobe, true, -1, BINARY, offs[0]);
+    if (!links[1]) {
+        fprintf(stderr, "%zu: failed to attach uretprobe\n", offs[0]);
+        err = -1;
+        goto cleanup;
+    }
+
+    // attach to other
+    for (size_t i = 1; i < oi; i++) {
         links[2*i] = bpf_program__attach_uprobe(
             skel->progs.do_uprobe, false, -1, BINARY, offs[i]);
         if (!links[2*i]) {
@@ -187,7 +205,6 @@ int main(int argc, char **argv) {
             err = -1;
             goto cleanup;
         }
-        // exit
         links[2*i+1] = bpf_program__attach_uprobe(
             skel->progs.do_uretprobe, true, -1, BINARY, offs[i]);
         if (!links[2*i+1]) {

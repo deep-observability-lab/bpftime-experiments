@@ -3,19 +3,14 @@
 #include <bpf/bpf_tracing.h>
 #include "uprobe.h"
 
-#define NORD_ETH_P_IP 0x0008
-#define DATA_OFF_OFFSET 16
+#define NORD_ETH_P_IP    0x0008
+#define DATA_OFF_OFFSET  16
 #define EHTERTYPE_OFFSET 12
-#define PROTO_OFFSET 23
-#define SADDR_OFFSET 26
-#define DADDR_OFFSET 30
-#define SPORT_OFFSET 34
-#define DPORT_OFFSET 36
-
-struct tstate {
-    __u32 depth;   // how many probed calls this thread has open right now
-    __u64 bits;    // bit i = 1 means the call at depth i passed the filter
-};
+#define PROTO_OFFSET     23
+#define SADDR_OFFSET     26
+#define DADDR_OFFSET     30
+#define SPORT_OFFSET     34
+#define DPORT_OFFSET     36
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -40,10 +35,10 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1024);
-    __type(key, __u64);            // thread id
-    __type(value, struct tstate);  // that thread's record
-} tstates SEC(".maps");
+    __uint(max_entries, MAX_DEPTH);
+    __type(key, __u64);
+    __type(value, __u32);
+} depths SEC(".maps");
 
 static __always_inline int match(struct pt_regs *ctx) {
     __u8 *mbuf = (__u8 *)PT_REGS_PARM1(ctx), *buf_addr, *pkt, proto;
@@ -82,31 +77,44 @@ static __always_inline int match(struct pt_regs *ctx) {
         if (tf->dport != 0 && dport != tf->dport) return 0;
     }
 
-    return 1;   // every check passed
+    return 1;
+}
+
+SEC("uprobe")
+int do_uprobe_match(struct pt_regs *ctx) {
+    if (!match(ctx)) return 0;
+
+    __u64 tid = bpf_get_current_pid_tgid();
+    __u32 *dp = bpf_map_lookup_elem(&depths, &tid);
+    if (!dp) {
+        __u32 init = 0; 
+        bpf_map_update_elem(&depths, &tid, &init, BPF_NOEXIST);
+        dp = bpf_map_lookup_elem(&depths, &tid);
+        if (!dp) return 0;
+    }
+
+    (*dp)++; // advance one level deeper, this also enables tracing for later uprobes
+
+    // added LSB specifies entry (0) or exit (1)
+    __u32 key = (__u32)(PT_REGS_IP(ctx) << 1);
+    __u64 init = 1, *val = bpf_map_lookup_elem(&counters, &key);
+    if (val) (*val)++;
+    else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
+
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
+    return 0;
 }
 
 SEC("uprobe")
 int do_uprobe(struct pt_regs *ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
-    struct tstate *ts = bpf_map_lookup_elem(&tstates, &tid);
-    if (!ts) {
-        struct tstate zero = {0};
-        bpf_map_update_elem(&tstates, &tid, &zero, BPF_NOEXIST);
-        ts = bpf_map_lookup_elem(&tstates, &tid);
-        if (!ts) return 0;
-    }
+    __u32 *dp = bpf_map_lookup_elem(&depths, &tid);
+    if (!dp || *dp == 0) return 0; // no flow matched
 
-    __u32 d = ts->depth;
-    ts->depth = d + 1;              // every entry goes one level deeper
-    if (d >= 64) return 0;          // too deep, bits has only 64 slots
+    __u32 d = *dp;
+    if (d > MAX_DEPTH) return 0;
+    (*dp)++;
 
-    if (!match(ctx)) {              // filter failed
-        ts->bits &= ~(1ULL << d);   // mark this level as "not traced"
-        return 0;
-    }
-    ts->bits |= (1ULL << d);        // mark this level as "traced"
-
-    // added LSB specifies entry (0) or exit (1)
     __u32 key = (__u32)(PT_REGS_IP(ctx) << 1);
     __u64 init = 1, *val = bpf_map_lookup_elem(&counters, &key);
     if (val) (*val)++;
@@ -119,13 +127,12 @@ int do_uprobe(struct pt_regs *ctx) {
 SEC("uretprobe")
 int do_uretprobe(struct pt_regs *ctx) {
     __u64 tid = bpf_get_current_pid_tgid();
-    struct tstate *ts = bpf_map_lookup_elem(&tstates, &tid);
-    if (!ts || ts->depth == 0) return 0;   // no matching entry, so ignore
+    __u32 *dp = bpf_map_lookup_elem(&depths, &tid);
+    if (!dp || *dp == 0) return 0;
 
-    __u32 d = ts->depth - 1;               // the level this call was entered at
-    ts->depth = d;                         // go back up one level
-    if (d >= 64) return 0;
-    if (!(ts->bits & (1ULL << d))) return 0;   // its entry was filtered out, drop
+    __u32 d = *dp;
+    if (d == 0 || d > MAX_DEPTH) return 0;
+    (*dp)--; // retreat one level
 
     __u32 key = (__u32)((PT_REGS_IP(ctx) << 1) | 1);
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));

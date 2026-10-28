@@ -1,10 +1,11 @@
 #ifndef UPROBE_H
 #define UPROBE_H
 
-#define REVF     "revents.txt"
-#define RCOUF    "rcounts.txt"
-#define MAX_LINE 1024
-#define FUNC     32
+#define REVF      "revents.txt"
+#define RCOUF     "rcounts.txt"
+#define MAX_LINE  1024
+#define FUNC      32
+#define MAX_DEPTH 1024
 
 struct flow {
     __u8   proto;

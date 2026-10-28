@@ -7,7 +7,6 @@
 #include "uprobe.h"
 
 #define MAX_NAME  64
-#define MAX_DEPTH 4096
 #define MAX_EDGE  (FUNC * (FUNC - 1))
 
 struct map {
