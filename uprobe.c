@@ -39,6 +39,10 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
 }
 
+static void handle_lost(void *ctx, int cpu, __u64 cnt) {
+    fprintf(stderr, "lost %llu events on cpu %d\n", (unsigned long long)cnt, cpu);
+}
+
 int main(int argc, char **argv) {
     if (argc != 6) {
         fprintf(stderr,
@@ -162,6 +166,7 @@ int main(int argc, char **argv) {
 
     if (bpf_map__set_max_entries(skel->maps.events, ncpus) != 0) {
         fprintf(stderr, "failed to resize events map to %d cpus\n", ncpus);
+        err = -1;
         goto cleanup;
     }
 
@@ -175,6 +180,7 @@ int main(int argc, char **argv) {
     if (bpf_map__update_elem(skel->maps.target,
                              &key, sizeof(key), &tf, sizeof(tf), BPF_ANY) != 0) {
         fprintf(stderr, "failed to pass target flow to eBPF\n");
+        err = -1;
         goto cleanup;
     }
 
@@ -183,7 +189,7 @@ int main(int argc, char **argv) {
         links[2*i] = bpf_program__attach_uprobe(
             skel->progs.do_uprobe, false, -1, BINARY, offs[i]);
         if (!links[2*i]) {
-            fprintf(stderr, "%zu: failed to attach uprobe\n", offs[i]);
+            fprintf(stderr, "%#zx: failed to attach uprobe\n", offs[i]);
             err = -1;
             goto cleanup;
         }
@@ -191,13 +197,13 @@ int main(int argc, char **argv) {
         links[2*i+1] = bpf_program__attach_uprobe(
             skel->progs.do_uretprobe, true, -1, BINARY, offs[i]);
         if (!links[2*i+1]) {
-            fprintf(stderr, "%zu: failed to attach uretprobe\n", offs[i]);
+            fprintf(stderr, "%#zx: failed to attach uretprobe\n", offs[i]);
             err = -1;
             goto cleanup;
         }
     }
 
-    pb = perf_buffer__new(bpf_map__fd(skel->maps.events), PAGEC, handle_event, NULL, NULL, NULL);
+    pb = perf_buffer__new(bpf_map__fd(skel->maps.events), PAGEC, handle_event, handle_lost, NULL, NULL);
     if (!pb) {
         fprintf(stderr, "perf_buffer__new failed\n");
         err = -1;
