@@ -238,6 +238,7 @@ int main(int argc, char **argv) {
         pret = perf_buffer__poll(pb, 100);
         if (pret < 0 && pret != -EINTR) {
             fprintf(stderr, "perf_buffer__poll failed: %d\n", pret);
+            err = pret;
             break;
         }
     }
@@ -252,9 +253,11 @@ int main(int argc, char **argv) {
     }
     // also write binary base to rcounts.txt
     fwrite(&base, sizeof(uint64_t), 1, fp);
-    while (bpf_map__get_next_key(skel->maps.counters, &key, &key, sizeof(key)) == 0
+    uint32_t *prev_key = NULL;
+    while (bpf_map__get_next_key(skel->maps.counters, prev_key, &key, sizeof(key)) == 0
            && bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
                                  counts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
+            prev_key = &key;
             tcount = 0;
             for (size_t i = 0; i < ncpus; i++) tcount += counts[i];
             fwrite(&key, sizeof(uint32_t), 1, fp);
