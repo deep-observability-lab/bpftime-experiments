@@ -34,9 +34,10 @@ static void sig_handler(int sig) { exiting = true; }
 FILE *fp;
 
 static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
-    if (!fp || !data || size < sizeof(uint32_t)) return;
+    if (!fp || !data || size < 12) return;
     fwrite(data, sizeof(uint32_t), 1, fp);
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
+    fwrite((char *)data + 4, sizeof(uint64_t), 1, fp);   // timestamp
 }
 
 static void handle_lost(void *ctx, int cpu, __u64 cnt) {

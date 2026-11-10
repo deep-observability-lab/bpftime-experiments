@@ -101,7 +101,9 @@ int do_uprobe_match(struct pt_regs *ctx) {
     if (val) (*val)++;
     else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
 
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
+    __u64 t = bpf_ktime_get_ns();
+    __u32 ev[3] = { key, (__u32)t, (__u32)(t >> 32) };
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, sizeof(ev));
     return 0;
 }
 
@@ -120,7 +122,9 @@ int do_uprobe(struct pt_regs *ctx) {
     if (val) (*val)++;
     else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
 
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
+    __u64 t = bpf_ktime_get_ns();
+    __u32 ev[3] = { key, (__u32)t, (__u32)(t >> 32) };
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, sizeof(ev));
     return 0;
 }
 
@@ -135,7 +139,9 @@ int do_uretprobe(struct pt_regs *ctx) {
     (*dp)--; // retreat one level
 
     __u32 key = (__u32)((PT_REGS_IP(ctx) << 1) | 1);
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
+    __u64 t = bpf_ktime_get_ns();
+    __u32 ev[3] = { key, (__u32)t, (__u32)(t >> 32) };
+    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, sizeof(ev));
     return 0;
 }
 

@@ -133,11 +133,13 @@ int main(int argc, char **argv) {
     }
     uint8_t is_exit, exist;
     uint32_t cpu, ei = 0;
+    uint64_t ts;
     struct stack st = {0};
     struct edge e, edges[MAX_EDGE] = {0};
     puts("\n----<entry and exit events>----");
     while (fread(&key, sizeof(uint32_t), 1, fp) == 1
-           && fread(&cpu, sizeof(uint32_t), 1, fp) == 1) {
+       && fread(&cpu, sizeof(uint32_t), 1, fp) == 1
+       && fread(&ts, sizeof(uint64_t), 1, fp) == 1) {
         is_exit = key & 1;
         key = (key - (uint32_t)(base << 1)) >> 1;
 
@@ -171,8 +173,8 @@ int main(int argc, char **argv) {
 
         for (uint8_t i = 0; i < mi; i++)
             if (maps[i].key == key) {
-                printf("%s %s on cpu=%"PRIu32"\n",
-                       is_exit ? "EXIT " : "ENTER", maps[i].name, cpu);
+                printf("%s %s on cpu=%"PRIu32" ts=%"PRIu64"\n",
+                   is_exit ? "EXIT " : "ENTER", maps[i].name, cpu, ts);
                 break;
             }
     }
