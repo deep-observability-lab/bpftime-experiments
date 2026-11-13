@@ -32,9 +32,9 @@ bpftime-experiments/
 ├── README.md        # Description of the project (Current file) 
 ├── Makefile         # Builds libbpf, bpftool, the eBPF object, the skeleton, `uprobe` and `post` (set BPFTROOT first)
 ├── uprobe.bpf.c     # eBPF programs: do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, per-thread entry/exit pairing, maps
-├── uprobe.c         # libbpf loader: parses the filter args and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes output files
+├── uprobe.c         # libbpf loader: parses the filter args and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes `revents.txt` (clock header + timestamped events) and `rcounts.txt`
 ├── uprobe.h         # Shared constants: output file names (revents.txt, rcounts.txt), MAX_LINE, FUNC (=32)
-├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, ENTER/EXIT trace and function graph
+├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, a UTC-timestamped ENTER/EXIT trace and function graph
 ├── funcs.conf       # Input: "<function_name> <offset> [<offset> ...]" lines (16 functions, 22 offsets) inside dpdk-testpmd
 └── .gitignore       # Ignores .output/, uprobe, post, *.txt (run outputs) and *.conf
 ```
@@ -234,6 +234,7 @@ All experiments share **one** eBPF object (`uprobe.bpf.c`) and **one** loader (`
 | uprobe / uretprobe attachment | **Yes** | `do_uprobe` / `do_uretprobe`, `bpf_program__attach_uprobe()` |
 | Ring buffer | **No.** There is no `BPF_MAP_TYPE_RINGBUF` / `ring_buffer__*` anywhere in the code. | — |
 | Perf buffer | **Yes** | `events` map (`BPF_MAP_TYPE_PERF_EVENT_ARRAY`), `perf_buffer__new/poll` |
+| Event timestamps (UTC, ns resolution) | **Yes** | `bpf_ktime_get_ns()` in `uprobe.bpf.c`, clock header written by `uprobe.c`, converted to UTC by `post.c` (section 3.9) |
 | Post-processing | **Yes**: counts, event trace, function graph | `post.c` |
 | Scripts | Only the helper `vetap.sh` (namespace setup, listed in section 4.2, not part of the repository) | — |
 
@@ -416,12 +417,15 @@ struct {
     __type(value, __u32);
 } events SEC(".maps");
 ...
-bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &key, sizeof(key));
+__u64 t = bpf_ktime_get_ns();
+__u32 ev[3] = { key, (__u32)t, (__u32)(t >> 32) };
+bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, sizeof(ev));
 ```
 
 * Before loading, the loader resizes `events` to the number of possible CPUs (`bpf_map__set_max_entries(..., libbpf_num_possible_cpus())`).
 * It creates `perf_buffer__new(..., PAGEC = 2048 pages, handle_event, ...)` and polls it every 100 ms until SIGINT/SIGTERM.
-* Each event payload is just the 4-byte key. `handle_event` appends **8 bytes per event** to `revents.txt`: `u32 key`, then `u32 cpu`.
+* Each event payload is **12 bytes**: the `u32` key followed by the 64-bit timestamp (low half, then high half). `handle_event` appends **16 bytes per event** to `revents.txt`: `u32 key`, `u32 cpu`, `u64 ts`.
+* The payload must not grow beyond 12 bytes: under bpftime v0.9.0 a 16-byte payload made `uprobe` hang on Ctrl-C (see section 6.2).
 
 ### 3.7 Experiment: post-processing (counts, trace, function graph)
 
@@ -439,6 +443,25 @@ At return time the first-argument register no longer holds the mbuf, so the exit
 * **Exit:** if `depth == 0`, ignore the event. Otherwise `d = depth - 1`, `depth = d`, and emit EXIT only if bit `d` is 1.
 
 Each nesting level has its own bit, so nested probed calls cannot overwrite each other's decisions. Every emitted EXIT now has a matching ENTER on the same thread.
+
+### 3.9 Event timestamps (UTC)
+
+**Files:** `uprobe.bpf.c`, `uprobe.c`, `post.c`.
+
+Every ENTER/EXIT event carries a timestamp taken inside the eBPF program with `bpf_ktime_get_ns()`, right before the event is sent. The value is nanoseconds on the kernel's monotonic clock (time since boot). bpftime reads it in userspace without a system call: a `strace -f -c` of testpmd under load showed no clock-related syscalls. (strace does not show vDSO calls, so this proves that there are no syscalls, not how the time is read.) The converted UTC times were also compared with `date -u` and agree, which confirms the clock is `CLOCK_MONOTONIC`.
+
+A monotonic time is not a calendar time, so `uprobe` writes a 16-byte header at the start of `revents.txt`: `CLOCK_REALTIME` and `CLOCK_MONOTONIC` in ns, read back to back right before the event loop starts. `post` computes `offset = realtime - monotonic` and prints `ts + offset` as UTC with nanosecond precision. The offset is stored in the file, so a trace can be post-processed later, after a reboot, or on another machine.
+
+```
+[2026-11-13T20:53:22.091394069Z] ENTER rte_pktmbuf_read on cpu=1
+[2026-11-13T20:53:22.091395154Z] EXIT  rte_pktmbuf_read on cpu=1
+```
+
+Things to know when reading these times:
+
+* Consecutive events on one CPU are about 1.1 to 1.4 microseconds apart, even for tiny functions. This is the per-event probe cost, not the function body. In bpftime v0.9.0, `bpf_perf_event_output` pins the thread to its CPU around every call (one `sched_getaffinity` and two `sched_setaffinity` syscalls per event, seen with strace). These syscalls were already there before the timestamps were added. EXIT minus ENTER is good for comparing functions, but each difference includes roughly 1 us of probe overhead.
+* The timestamp is taken just before the event is sent, not at the function entry. In `do_uprobe_match` the packet filter runs before it, so that ENTER is slightly late.
+* A zero-syscall event path would need a ring buffer (`BPF_MAP_TYPE_RINGBUF`) instead of the perf buffer. That is not implemented.
 
 ---
 
@@ -634,6 +657,17 @@ rte_net_get_ptype: 85675
 
 The filter keeps only the ns1 → ns2 TCP data packets, so the counts are lower than the total number of forwarded packets. In both runs, `pmd_rx_burst`, `pmd_tx_burst`, `pkt_burst_io_forward` and `rte_mbuf_raw_alloc` have no ENTER events, because their first argument is not an `rte_mbuf *` (limitation 1). This sample was recorded before the per-thread pairing (section 3.8). The unmatched EXIT events in it came from the old uretprobe, and they no longer appear.
 
+**Event lines with timestamps.** Since section 3.9, every ENTER/EXIT line starts with a UTC time in brackets. A real excerpt:
+
+```
+[2026-11-13T20:53:22.091394069Z] ENTER rte_pktmbuf_read on cpu=1
+[2026-11-13T20:53:22.091395154Z] EXIT  rte_pktmbuf_read on cpu=1
+[2026-11-13T20:53:22.091396344Z] ENTER rte_pktmbuf_read on cpu=1
+[2026-11-13T20:53:22.091397433Z] EXIT  rte_pktmbuf_read on cpu=1
+```
+
+The event lines in the two sample runs above were recorded before this change, so they show the older format without times.
+
 ---
 
 ## 5. Post-processing and interpreting results
@@ -643,9 +677,11 @@ The filter keeps only the ns1 → ns2 TCP data packets, so the counts are lower 
 | File | Layout |
 |---|---|
 | `rcounts.txt` | `u64 base` (testpmd load base, the first mapping of `/usr/local/bin/dpdk-testpmd` in `/proc/<pid>/maps`), followed by repeated `{ u32 key; u64 count; }` (12 bytes each, unpadded) |
-| `revents.txt` | Repeated `{ u32 key; u32 cpu; }`, in the order the perf buffer delivered them |
+| `revents.txt` | A 16-byte header `{ u64 realtime_ns; u64 monotonic_ns; }` (`CLOCK_REALTIME` and `CLOCK_MONOTONIC`, read when `uprobe` started), followed by repeated 16-byte records `{ u32 key; u32 cpu; u64 ts; }` in the order the perf buffer delivered them. `ts` is `bpf_ktime_get_ns()` (ns, monotonic). |
 
 `key` is `(runtime_IP << 1) | is_exit`, truncated to 32 bits.
+
+Older `revents.txt` files (8-byte records, or no 16-byte header) cannot be read by the current `post`. `uprobe` rewrites `revents.txt` on every run, so this only matters for traces saved from older versions.
 
 ### 5.2 What `post` does
 
@@ -656,7 +692,7 @@ The filter keeps only the ns1 → ns2 TCP data packets, so the counts are lower 
 1. **Mapping:** reads `name offset...` lines into up to 32 `(offset, name)` pairs.
 2. **Address decoding:** for every key it computes `offset = (key - (u32)(base << 1)) >> 1`, which removes the ASLR base and the entry/exit bit. It then looks up the name. The exit flag is `key & 1`.
 3. **Call counts:** prints `name: count` for every counter whose offset is listed in the mapping file.
-4. **Event trace:** prints `ENTER name on cpu=N` / `EXIT  name on cpu=N` in file order.
+4. **Event trace:** reads the clock header, computes the UTC offset, and prints `[<UTC time>] ENTER name on cpu=N` / `[<UTC time>] EXIT  name on cpu=N` in file order. The time is ISO 8601 UTC with nanoseconds, for example `2026-11-13T20:53:22.091394069Z`.
 5. **Function graph:** replays the events against a shadow call stack (max depth 4096):
    * on **ENTER**, it records an edge `(caller = top of stack or 0, callee)` and increments the edge's count, then pushes the callee;
    * on **EXIT**, it pops the stack.
@@ -677,6 +713,7 @@ else {                         // is entry, create edge or increment count
 
 * **Counts** are the number of **filtered** entries per probed address, summed over all CPUs. If a function has several offsets (inlined copies), `post` prints one line per offset, all with the same name. Add them up for a per-function total.
 * **Events** are only events that passed the filter. The `cpu` value is the CPU that emitted the event, which tells you which lcore handled the packet.
+* **Timestamps** are comparable across CPUs (same clock) and increase per CPU. The file order is not global time order, because the perf buffer is drained per CPU. Sort on the time column if you need one global timeline. See section 3.9 for the probe overhead that every ENTER/EXIT difference includes.
 * **The graph** is a dynamic call graph limited to the probed functions. An edge `A --[n]--> B` means B was entered n times while A was the innermost traced function still open. The stack is global, not per-CPU or per-thread. With several forwarding lcores, interleaved events from different CPUs can create artificial edges, so use a single forwarding core when you want a clean graph.
 * Functions whose first argument is **not** an `rte_mbuf *` will rarely or never appear (see Limitations). Examples are `rte_lcore_id(void)`, `rte_eth_rx_burst(port_id, ...)`, `pmd_rx_burst(queue, ...)`, `pkt_burst_io_forward(fs)` and `rte_mbuf_raw_alloc(mempool)`.
 
@@ -705,6 +742,8 @@ else {                         // is entry, create edge or increment count
 | `rcounts.txt` empty or missing | The loader was killed with SIGKILL, or exited on an error. Counts are written only after a clean SIGINT/SIGTERM. |
 | `post`: `call stack exceeded MAX_DEPTH (4096), aborting` | Many ENTER events without matching EXIT events. Usually events were lost from the perf buffer, or the loader was stopped while many calls were still open. |
 | `post` prints nothing for some functions | Their first argument is not an mbuf (filtered out), or the mapping/offset does not match the decoded address. |
+| `post` prints absurd times, or `could not read header from revents.txt` | `revents.txt` comes from an older version (8-byte records, or no 16-byte header). Capture a new trace with the current `uprobe`. |
+| `uprobe` does not exit on Ctrl-C | The event payload passed to `bpf_perf_event_output` is larger than 12 bytes. Under bpftime v0.9.0 a 16-byte payload hung the loader (root cause not found). Keep the payload at 12 bytes or less, and test Ctrl-C after every change to it. |
 
 ### 6.2 Known limitations
 
@@ -720,6 +759,9 @@ else {                         // is entry, create edge or increment count
 10. **Counts only on clean exit.** The map is dumped after the poll loop ends.
 11. **`post` loads its whole edge list on the stack and does a linear search.** That is fine for the small configs used here.
 12. The **offsets in `funcs.conf` are build-specific.** They must be regenerated with `readelf` (section 3.1.1) whenever testpmd is rebuilt.
+13. **Event payload is limited to 12 bytes.** Payloads of 4, 8 and 12 bytes were tested and work. With 16 bytes, `uprobe` hangs on Ctrl-C under bpftime v0.9.0. The cause is unknown: `bpf_perf_event_output` and bpftime's perf buffer have no size check that explains it. Adding fields to the event (for example the pid) needs this limit to be understood first.
+14. **The UTC offset is fixed when the loader starts.** The two clock reads are separate calls (an error of tens of nanoseconds), and a later step of the wall clock (manual change, NTP step) is not reflected in a trace that was already written.
+15. **Timestamps include probe overhead.** Each event costs about 1 us (section 3.9), and the time is taken when the event is sent, not at the function boundary.
 
 ---
 

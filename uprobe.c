@@ -12,6 +12,7 @@
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include "uprobe.skel.h"
+#include <time.h>
 #include <linux/types.h>
 #include "uprobe.h"
 
@@ -234,6 +235,16 @@ int main(int argc, char **argv) {
         err = -1;
         goto cleanup;
     }
+    
+    // offset to change time to UTC
+    struct timespec rt, mt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &mt);
+    uint64_t hdr[2] = {
+        (uint64_t)rt.tv_sec * 1000000000ULL + rt.tv_nsec,
+        (uint64_t)mt.tv_sec * 1000000000ULL + mt.tv_nsec,
+    };
+    fwrite(hdr, sizeof(hdr), 1, fp);
 
     while (!exiting) {
         pret = perf_buffer__poll(pb, 100);

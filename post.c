@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <linux/types.h>
+#include <time.h>
 #include "uprobe.h"
 
 #define MAX_NAME  64
@@ -131,6 +132,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "failed to fopen revents.txt\n");
         return 1;
     }
+
+    uint64_t hdr[2];
+    if (fread(hdr, sizeof(hdr), 1, fp) != 1) {
+        fprintf(stderr, "could not read header from revents.txt\n");
+        return 1;
+    }
+    int64_t off = (int64_t)(hdr[0] - hdr[1]);
+
     uint8_t is_exit, exist;
     uint32_t cpu, ei = 0;
     uint64_t ts;
@@ -173,8 +182,15 @@ int main(int argc, char **argv) {
 
         for (uint8_t i = 0; i < mi; i++)
             if (maps[i].key == key) {
-                printf("%s %s on cpu=%"PRIu32" ts=%"PRIu64"\n",
-                   is_exit ? "EXIT " : "ENTER", maps[i].name, cpu, ts);
+                uint64_t utc = ts + off;
+                time_t sec = (time_t)(utc / 1000000000ULL);
+                struct tm tm;
+                char tbuf[32];
+                gmtime_r(&sec, &tm);
+                strftime(tbuf, sizeof tbuf, "%Y-%m-%dT%H:%M:%S", &tm);
+                printf("[%s.%09"PRIu64"Z] %s %s on cpu=%"PRIu32"\n",
+                    tbuf, (uint64_t)(utc % 1000000000ULL),
+                    is_exit ? "EXIT " : "ENTER", maps[i].name, cpu);
                 break;
             }
     }
