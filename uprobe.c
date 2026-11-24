@@ -38,7 +38,7 @@ static void handle_event(void *ctx, int cpu, void *data, unsigned int size) {
     if (!fp || !data || size < 12) return;
     fwrite(data, sizeof(uint32_t), 1, fp);
     fwrite(&cpu, sizeof(uint32_t), 1, fp);
-    fwrite((char *)data + 4, sizeof(uint64_t), 1, fp);   // timestamp
+    fwrite((char *)data + 4, sizeof(uint64_t), 1, fp); // timestamp
 }
 
 static void handle_lost(void *ctx, int cpu, __u64 cnt) {
@@ -46,15 +46,14 @@ static void handle_lost(void *ctx, int cpu, __u64 cnt) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr,
-                "usage: %s proto src_addr dst_addr src_port dst_port (use 0 as wildcard)\n",
-                argv[0]);
+    if (argc != 7) {
+        fprintf(stderr, "usage: %s <proto> <src_addr> <dst_addr> <src_port>"
+                "<dst_port> <sample_rate> (use 0 as wildcard)\n", argv[0]);
         return 1;
     }
 
     struct flow tf = {0};
-    uint32_t key = 0;
+    uint32_t sr, key = 0;
 
     tf.proto = (uint8_t)atoi(argv[1]);
 
@@ -72,6 +71,8 @@ int main(int argc, char **argv) {
 
     tf.sport = htons((uint16_t)atoi(argv[4]));
     tf.dport = htons((uint16_t)atoi(argv[5]));
+
+    sr = (uint32_t)atoi(argv[6]);
 
     // read offsets from conf file
     fp = fopen(CONF, "r");
@@ -179,6 +180,17 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    if (sr != 0) {
+        uint32_t srray[ncpus];
+        for (size_t i = 0; i < ncpus; i++) srray[i] = UINT32_MAX / sr;
+        if (bpf_map__update_elem(skel->maps.sthresh, &key, sizeof(key),
+                                 srray, round_up(sizeof(sr), 8) * ncpus, BPF_ANY) != 0) {
+            fprintf(stderr, "failed to pass sample_rate to eBPF\n");
+            err = -1;
+            goto cleanup;
+        }
+    }
+
     if (bpf_map__update_elem(skel->maps.target,
                              &key, sizeof(key), &tf, sizeof(tf), BPF_ANY) != 0) {
         fprintf(stderr, "failed to pass target flow to eBPF\n");
@@ -268,7 +280,7 @@ int main(int argc, char **argv) {
     uint32_t *prev_key = NULL;
     while (bpf_map__get_next_key(skel->maps.counters, prev_key, &key, sizeof(key)) == 0
            && bpf_map__lookup_elem(skel->maps.counters, &key, sizeof(key),
-                                 counts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
+                                   counts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
             prev_key = &key;
             tcount = 0;
             for (size_t i = 0; i < ncpus; i++) tcount += counts[i];

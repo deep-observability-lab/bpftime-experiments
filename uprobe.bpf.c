@@ -20,6 +20,13 @@ struct {
 } target SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} sthresh SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __uint(max_entries, FUNC);
     __type(key, __u32);
@@ -84,22 +91,27 @@ SEC("uprobe")
 int do_uprobe_match(struct pt_regs *ctx) {
     if (!match(ctx)) return 0;
 
+    const __u32 zkey = 0;
+    const __u32 *sth = bpf_map_lookup_elem(&sthresh, &zkey);
+    if (sth)
+        if (*sth != 0 && bpf_get_prandom_u32() >= *sth) return 0;
+
+    // added LSB specifies entry (0) or exit (1)
+    const __u32 key = (__u32)(PT_REGS_IP(ctx) << 1);
+    __u64 init = 1, *val = bpf_map_lookup_elem(&counters, &key);
+    if (val) (*val)++;
+    else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
+
     __u64 tid = bpf_get_current_pid_tgid();
     __u32 *dp = bpf_map_lookup_elem(&depths, &tid);
     if (!dp) {
-        __u32 init = 0; 
+        __u32 init = 0;
         bpf_map_update_elem(&depths, &tid, &init, BPF_NOEXIST);
         dp = bpf_map_lookup_elem(&depths, &tid);
         if (!dp) return 0;
     }
 
     (*dp)++; // advance one level deeper, this also enables tracing for later uprobes
-
-    // added LSB specifies entry (0) or exit (1)
-    __u32 key = (__u32)(PT_REGS_IP(ctx) << 1);
-    __u64 init = 1, *val = bpf_map_lookup_elem(&counters, &key);
-    if (val) (*val)++;
-    else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
 
     __u64 t = bpf_ktime_get_ns();
     __u32 ev[3] = { key, (__u32)t, (__u32)(t >> 32) };
