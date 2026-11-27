@@ -47,6 +47,46 @@ struct {
     __type(value, __u32);
 } depths SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct path_key);
+    __type(value, __u64);
+} paths SEC(".maps");
+
+static __always_inline void save_path(struct pt_regs *ctx) {
+    struct path_key k;
+    __builtin_memset(&k, 0, sizeof(k));
+    k.leaf = PT_REGS_IP(ctx);
+
+    __u64 ra = 0;
+    __u64 fp = PT_REGS_FP(ctx);
+    if (bpf_probe_read_user(&ra, sizeof(ra), (void *)PT_REGS_SP(ctx)) == 0 && ra != 0) {
+        k.frame[0] = ra;
+        k.nframes = 1;
+
+#pragma unroll
+        for (int i = 1; i < STACK_FRAMES; i++) {
+            __u64 next_fp = 0, next_ra = 0;
+            if (fp == 0)
+                break;
+            if (bpf_probe_read_user(&next_ra, sizeof(next_ra), (void *)(fp + 8)) != 0)
+                break;
+            if (bpf_probe_read_user(&next_fp, sizeof(next_fp), (void *)fp) != 0)
+                break;
+            if (next_ra == 0 || next_fp <= fp)
+                break;
+            k.frame[i] = next_ra;
+            k.nframes = i + 1;
+            fp = next_fp;
+        }
+    }
+
+    __u64 init = 1, *val = bpf_map_lookup_elem(&paths, &k);
+    if (val) (*val)++;
+    else bpf_map_update_elem(&paths, &k, &init, BPF_ANY);
+}
+
 static __always_inline int match(struct pt_regs *ctx) {
     __u8 *mbuf = (__u8 *)PT_REGS_PARM1(ctx), *buf_addr, *pkt, proto;
     if (!mbuf) return 0;
@@ -89,6 +129,7 @@ static __always_inline int match(struct pt_regs *ctx) {
 
 SEC("uprobe")
 int do_uprobe_match(struct pt_regs *ctx) {
+    save_path(ctx);
     if (!match(ctx)) return 0;
 
     const __u32 zkey = 0;
@@ -121,6 +162,7 @@ int do_uprobe_match(struct pt_regs *ctx) {
 
 SEC("uprobe")
 int do_uprobe(struct pt_regs *ctx) {
+    save_path(ctx);
     __u64 tid = bpf_get_current_pid_tgid();
     __u32 *dp = bpf_map_lookup_elem(&depths, &tid);
     if (!dp || *dp == 0) return 0; // no flow matched

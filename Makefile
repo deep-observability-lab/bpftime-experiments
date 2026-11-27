@@ -83,7 +83,7 @@ uprobe: $(OUTPUT)/uprobe.o $(LIBBPF_OBJ)
 
 # Build post with no flags
 post: post.c
-	$(Q)gcc post.c -o post
+	$(Q)gcc post.c -o post -lelf
 
 clean:
 	$(call msg,CLEAN)

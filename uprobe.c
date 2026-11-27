@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint64_t counts[ncpus], tcount;
+    uint64_t counts[ncpus], tcount, pcounts[ncpus], pcount;
     struct bpf_link *links[LINKS] = {0};
     struct perf_buffer *pb = NULL;
     int pret;
@@ -287,6 +287,26 @@ int main(int argc, char **argv) {
             fwrite(&key, sizeof(uint32_t), 1, fp);
             fwrite(&tcount, sizeof(uint64_t), 1, fp);
         }
+    fclose(fp);
+
+    fp = fopen(RSTACK, "wb");
+    if (!fp) {
+        fprintf(stderr, "failed to open rstacks.txt\n");
+        err = -1;
+        goto cleanup;
+    }
+    fwrite(&base, sizeof(uint64_t), 1, fp);
+    struct path_key cur, nxt, *prev_pk = NULL;
+    while (bpf_map__get_next_key(skel->maps.paths, prev_pk, &nxt, sizeof(nxt)) == 0
+           && bpf_map__lookup_elem(skel->maps.paths, &nxt, sizeof(nxt),
+                                   pcounts, round_up(sizeof(uint64_t), 8) * ncpus, 0) == 0) {
+        pcount = 0;
+        for (size_t i = 0; i < (size_t)ncpus; i++) pcount += pcounts[i];
+        fwrite(&nxt, sizeof(nxt), 1, fp);
+        fwrite(&pcount, sizeof(pcount), 1, fp);
+        cur = nxt;
+        prev_pk = &cur;
+    }
     fclose(fp);
 
 cleanup:

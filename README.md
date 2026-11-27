@@ -33,9 +33,9 @@ bpftime-experiments/
 ├── README.md        # Description of the project (Current file) 
 ├── Makefile         # Builds libbpf, bpftool, the eBPF object, the skeleton, `uprobe` and `post` (set BPFTROOT first)
 ├── uprobe.bpf.c     # eBPF programs: do_uprobe_match / do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, probability sampling, per-thread depth, maps
-├── uprobe.c         # libbpf loader: parses the filter args, sample_rate and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes `revents.txt` (clock header + timestamped events) and `rcounts.txt`
-├── uprobe.h         # Shared constants: output file names (revents.txt, rcounts.txt), MAX_LINE, FUNC (=32)
-├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, a UTC-timestamped ENTER/EXIT trace and function graph
+├── uprobe.c         # libbpf loader: parses the filter args, sample_rate and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes `revents.txt` (clock header + timestamped events), `rcounts.txt` and `rstacks.txt`
+├── uprobe.h         # Shared constants: output file names (revents.txt, rcounts.txt, rstacks.txt), MAX_LINE, FUNC (=32), STACK_FRAMES (=32)
+├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, a UTC-timestamped ENTER/EXIT trace and function graph, and rstacks.txt into a caller tree
 ├── funcs.conf       # Input: "<function_name> <offset> [<offset> ...]" lines (16 functions, 22 offsets) inside dpdk-testpmd
 └── .gitignore       # Ignores .output/, uprobe, post, *.txt (run outputs) and *.conf
 ```
@@ -48,6 +48,7 @@ uprobe                 # Loader binary
 post                   # Post-processing binary
 revents.txt            # BINARY event stream (despite the .txt suffix), written by uprobe
 rcounts.txt            # BINARY base address + per-address counts (despite the .txt suffix), written by uprobe
+rstacks.txt            # BINARY base address + caller chains (despite the .txt suffix), written by uprobe
 ```
 ---
 
@@ -77,7 +78,7 @@ The experiments were run in this environment:
 | `dpdk-testpmd` is installed at **`/usr/local/bin/dpdk-testpmd`**. The path is hard-coded as `BINARY`. | `uprobe.c` |
 | `dpdk-testpmd` is **already running** when `uprobe` starts. The loader runs `pidof dpdk-testpmd` and reads `/proc/<pid>/maps` to find the binary's load base. | `uprobe.c` |
 | `funcs.conf` is in the **current working directory**. | `uprobe.c` (`#define CONF "funcs.conf"`) |
-| `revents.txt` / `rcounts.txt` are written to and read from the **current working directory**. | `uprobe.h`, `uprobe.c`, `post.c` |
+| `revents.txt` / `rcounts.txt` / `rstacks.txt` are written to and read from the **current working directory**. | `uprobe.h`, `uprobe.c`, `post.c` |
 | The bpftime source tree provides `third_party/libbpf`, `third_party/bpftool` and `third_party/vmlinux/<arch>/vmlinux.h`. | `Makefile` (`BPFTROOT`) |
 | Build tools: `clang` (BPF target), `gcc`, `make`, `libelf` and `zlib` (link flags `-lelf -lz`). | `Makefile` |
 | The offsets in `funcs.conf` belong to the exact `dpdk-testpmd` binary in use. They must be regenerated after every rebuild (see [3.1.1](#311-generating-funcsconf-offsets)). | `funcs.conf` |
@@ -325,7 +326,7 @@ if (val) (*val)++;
 else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
 ```
 
-When the loader exits (Ctrl-C / SIGTERM), `uprobe.c` iterates the map with `bpf_map__get_next_key`, sums the per-CPU values, and writes them to `rcounts.txt`. Before the counts, it writes the testpmd load base so that `post` can turn runtime addresses back into file offsets.
+When the loader exits (Ctrl-C / SIGTERM), `uprobe.c` iterates the map with `bpf_map__get_next_key`, sums the per-CPU values, and writes them to `rcounts.txt`. Before the counts, it writes the testpmd load base so that `post` can turn runtime addresses back into file offsets. The same exit path writes `rstacks.txt` from the `paths` map (section 5.1).
 
 > Only **entries** are counted, and only for calls that **pass the packet filter** (section 3.4) and **are kept by the sampler** (section 3.10). The filter and the sampler run on the first offset in `funcs.conf`. With all-wildcard filter arguments (`0 0 0 0 0`) and `sample_rate` `0`, this still means "every IPv4 packet". A `sample_rate` of `N` counts about `1/N` of those hits, plus the nested probes under each kept hit.
 
@@ -407,6 +408,7 @@ links[2*i+1] = bpf_program__attach_uprobe(skel->progs.do_uretprobe,      true,  
 
 * `do_uprobe_match` (`SEC("uprobe")`) applies the 5-tuple filter and the sampler (section 3.10). A kept call increments the counter, raises the thread's depth and emits an **entry** event with key `IP<<1`.
 * `do_uprobe` (`SEC("uprobe")`) does not re-read the packet. It counts and emits an entry only while that thread's depth is above zero, which is how a kept hit of the first function pulls the nested probes in with it.
+* Both entry programs first call `save_path`, before the filter, the sampler and the depth check. That records the caller chain for every entry, including functions such as `rte_eth_rx_burst` whose first argument is not an mbuf. The exit probe does not record a chain.
 * `do_uretprobe` (`SEC("uretprobe")`) does **not** re-read the packet. It emits an **exit** event with key `(IP<<1)|1` only while depth is above zero, then lowers the depth. It does not count.
 
 The loader is a normal libbpf program. When it runs under `bpftime load`, bpftime's syscall server intercepts the BPF and perf-event syscalls, and the probes are installed in testpmd's userspace by the bpftime agent instead of the kernel.
@@ -517,7 +519,7 @@ Run the bpftime and post-processing commands from the project directory, because
 [terminal 4]  iperf3 server in ns2
 [terminal 1]  testpmd> start
 [terminal 3]  iperf3 client in ns1             (traffic flows through testpmd)
-[terminal 2]  Ctrl-C                           (flushes revents.txt / rcounts.txt)
+[terminal 2]  Ctrl-C                           (flushes revents.txt / rcounts.txt / rstacks.txt)
               ./post funcs.conf
 ```
 
@@ -619,7 +621,7 @@ sudo ip netns exec ns1 iperf3 -c 10.1.1.3 -t 5
 * Stop iperf3 server (Ctrl-C in terminal 4) and testpmd:
 
 ```bash
-ls -l revents.txt rcounts.txt
+ls -l revents.txt rcounts.txt rstacks.txt
 testpmd> stop                 # also prints forwarding statistics
 testpmd> quit
 ```
@@ -718,6 +720,7 @@ The event lines in the two sample runs above were recorded before this change, s
 |---|---|
 | `rcounts.txt` | `u64 base` (testpmd load base, the first mapping of `/usr/local/bin/dpdk-testpmd` in `/proc/<pid>/maps`), followed by repeated `{ u32 key; u64 count; }` (12 bytes each, unpadded) |
 | `revents.txt` | A 16-byte header `{ u64 realtime_ns; u64 monotonic_ns; }` (`CLOCK_REALTIME` and `CLOCK_MONOTONIC`, read when `uprobe` started), followed by repeated 16-byte records `{ u32 key; u32 cpu; u64 ts; }` in the order the perf buffer delivered them. `ts` is `bpf_ktime_get_ns()` (ns, monotonic). |
+| `rstacks.txt` | `u64 base`, followed by repeated records `{ struct path_key; u64 count; }`. `path_key` is `{ u64 leaf; u32 nframes; u32 pad; u64 frame[32]; }`. `leaf` is the probed instruction pointer. `frame[0]` is the return address in the direct caller, and each later slot is one frame further up. `count` is the number of entries that had this exact chain, summed over CPUs. |
 
 `key` is `(runtime_IP << 1) | is_exit`, truncated to 32 bits.
 
@@ -749,12 +752,23 @@ else {                         // is entry, create edge or increment count
 }
 ```
 
+6. **Caller graph:** if `rstacks.txt` is present, reads `FUNC` symbols (start and size) from `/usr/local/bin/dpdk-testpmd`. Each saved address is turned into a file offset by subtracting the base, then into the symbol whose range contains it. Frames that fall outside the binary are dropped, so the chain stops at the outermost testpmd function. The chain is reversed and the probed function is appended, and the path's count is added to every edge. The merged tree is printed under `----<caller graph>----`. A node that repeats on the path is printed and not expanded again. Two paths through the same root share that root:
+
+```
+A (1000000)
+ ├── B (999000)
+ │    └── rte_eth_rx_burst (999000)
+ └── C (1000)
+      └── rte_eth_rx_burst (1000)
+```
+
 ### 5.3 Interpreting the results
 
 * **Counts** are the number of **filtered and sampled** entries per probed address, summed over all CPUs (sections 3.4 and 3.10). If a function has several offsets (inlined copies), `post` prints one line per offset, all with the same name. Add them up for a per-function total. With `sample_rate` `N`, multiply by `N` for a rough estimate of the unsampled count.
 * **Events** are only events that passed the filter and were kept by the sampler. The `cpu` value is the CPU that emitted the event, which tells you which lcore handled the packet.
 * **Timestamps** are comparable across CPUs (same clock) and increase per CPU. The file order is not global time order, because the perf buffer is drained per CPU. Sort on the time column if you need one global timeline. See section 3.9 for the probe overhead that every ENTER/EXIT difference includes.
 * **The graph** is a dynamic call graph limited to the probed functions. An edge `A --[n]--> B` means B was entered n times while A was the innermost traced function still open. The stack is global, not per-CPU or per-thread. With several forwarding lcores, interleaved events from different CPUs can create artificial edges, so use a single forwarding core when you want a clean graph.
+* **The caller graph** counts every entry of every function in `funcs.conf`, including calls the packet filter and the sampler drop. A million entries of one chain are one record. The number on a node is the number of entries whose chain goes through that edge. The walk uses the frame pointer and stops after 32 frames, at a broken frame, or at the first address that is not a function in `dpdk-testpmd`. Inlined functions and tail calls leave no frame, so they do not appear.
 * Functions whose first argument is **not** an `rte_mbuf *` will rarely or never appear (see Limitations). Examples are `rte_lcore_id(void)`, `rte_eth_rx_burst(port_id, ...)`, `pmd_rx_burst(queue, ...)`, `pkt_burst_io_forward(fs)` and `rte_mbuf_raw_alloc(mempool)`.
 
 ---
@@ -780,7 +794,9 @@ else {                         // is entry, create edge or increment count
 | `perf_buffer__new failed` / `perf_buffer__poll failed: <err>` | The perf event array is not available, or bpftime is not intercepting the calls. Make sure you started it with `bpftime load`. |
 | Build cannot find `bpf/bpf_helpers.h` or the uapi headers | A **trailing slash** on `BPFTROOT` is recommended. The Makefile line `-I$(BPFTROOT)third_party/libbpf/include/uapi` has no `/` between the variable and `third_party`; without the slash, the bundled uapi include path is silently ignored and system headers are used. |
 | Build cannot find `vmlinux.h` / bpftool sources | Run `git submodule update --init --recursive` in the bpftime checkout. |
-| `rcounts.txt` empty or missing | The loader was killed with SIGKILL, or exited on an error. Counts are written only after a clean SIGINT/SIGTERM. |
+| `rcounts.txt` or `rstacks.txt` empty or missing | The loader was killed with SIGKILL, or exited on an error. Both files are written only after a clean SIGINT/SIGTERM. |
+| `failed to read symbols from /usr/local/bin/dpdk-testpmd` | `post` could not open the binary, so the caller graph is skipped. The counts and the event trace are still printed. |
+| caller graph shows addresses instead of names, or the first frame is not a testpmd function | The entry registers were not the caller's frame pointer and return address. The saved chain is then not a testpmd call stack. |
 | `post`: `call stack exceeded MAX_DEPTH (4096), aborting` | Many ENTER events without matching EXIT events. Usually events were lost from the perf buffer, or the loader was stopped while many calls were still open. |
 | `post` prints nothing for some functions | Their first argument is not an mbuf (filtered out), or the mapping/offset does not match the decoded address. |
 | `post` prints absurd times, or `could not read header from revents.txt` | `revents.txt` comes from an older version (8-byte records, or no 16-byte header). Capture a new trace with the current `uprobe`. |
@@ -794,8 +810,8 @@ else {                         // is entry, create edge or increment count
 4. **Inlined call sites are invisible.** The `funcs.conf` offsets are real `FUNC` symbols (out-of-line LOCAL copies of `static inline` helpers, section 3.1.1), so they have a normal call and return. Calls that the compiler inlined into their caller have no symbol and are never probed, so counts cover only the out-of-line copies you listed.
 5. **Fixed packet layout:** untagged Ethernet + IPv4 with a 20-byte header (no IP options, no VLAN, no IPv6). Ports are read at fixed offsets 34/36. Only the first segment (`buf_addr + data_off`) is parsed.
 6. **Little-endian only:** `NORD_ETH_P_IP` is hard-coded as `0x0008`.
-7. **Hard-coded paths:** `/usr/local/bin/dpdk-testpmd`, `funcs.conf`, `revents.txt`, `rcounts.txt`. `pidof` takes the **first** PID when several testpmd instances are running.
-8. **Size limits:** `counters` has 32 entries (`FUNC`). `post` keeps at most 32 name/offset pairs and at most `32*31` graph edges. The loader accepts at most 512 offsets (1024 links).
+7. **Hard-coded paths:** `/usr/local/bin/dpdk-testpmd`, `funcs.conf`, `revents.txt`, `rcounts.txt`, `rstacks.txt`. `pidof` takes the **first** PID when several testpmd instances are running.
+8. **Size limits:** `counters` has 32 entries (`FUNC`). `paths` holds at most 1024 distinct caller chains. `post` keeps at most 32 name/offset pairs and at most `32*31` graph edges for the probed graph. The loader accepts at most 512 offsets (1024 links).
 9. **32-bit keys:** `IP << 1` is truncated to 32 bits. Decoding works only if the offset inside the binary is below 2 GiB, which holds for testpmd.
 10. **Counts only on clean exit.** The map is dumped after the poll loop ends.
 11. **`post` loads its whole edge list on the stack and does a linear search.** That is fine for the small configs used here.
@@ -803,7 +819,8 @@ else {                         // is entry, create edge or increment count
 13. **Event payload is limited to 12 bytes.** Payloads of 4, 8 and 12 bytes were tested and work. With 16 bytes, `uprobe` hangs on Ctrl-C under bpftime v0.9.0. The cause is unknown: `bpf_perf_event_output` and bpftime's perf buffer have no size check that explains it. Adding fields to the event (for example the pid) needs this limit to be understood first.
 14. **The UTC offset is fixed when the loader starts.** The two clock reads are separate calls (an error of tens of nanoseconds), and a later step of the wall clock (manual change, NTP step) is not reflected in a trace that was already written.
 15. **Timestamps include probe overhead.** Each event costs about 1 us (section 3.9), and the time is taken when the event is sent, not at the function boundary.
-16. **Sampling is one draw on the first function in `funcs.conf`.** Nested probes are kept or dropped with that draw; they are not sampled on their own. `sample_rate` `0` keeps every match. The kept fraction for `N` ≥ 1 is `(UINT32_MAX / N) / 2^32`, just under `1/N`. Counts are of the sample (section 3.10).
+16. **Sampling is one draw on the first function in `funcs.conf`.** Nested probes are kept or dropped with that draw; they are not sampled on their own. `sample_rate` `0` keeps every match. The kept fraction for `N` ≥ 1 is `(UINT32_MAX / N) / 2^32`, just under `1/N`. Counts in `rcounts.txt` are of the sample (section 3.10). The caller graph is not sampled.
+17. **The caller walk goes up only.** It records who called a probed function, not the functions that probed function calls. A chain longer than 32 frames is cut. A frame without a frame pointer, an inlined helper, or a tail call is missing. The first run should be checked: the caller directly above a probed function must be a real testpmd function.
 
 ---
 

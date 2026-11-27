@@ -3,9 +3,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <linux/types.h>
 #include <time.h>
+#include <gelf.h>
+#include <libelf.h>
 #include "uprobe.h"
+
+#define BINARY "/usr/local/bin/dpdk-testpmd"
 
 #define MAX_NAME  64
 #define MAX_EDGE  (FUNC * (FUNC - 1))
@@ -47,6 +53,245 @@ void print_tree(uint32_t current_caller, struct map *maps, uint8_t mi, struct ed
             print_tree(edges[i].callee, maps, mi, edges, ei, depth + 1);
         }
     }
+}
+
+struct sym {
+    uint64_t start;
+    uint64_t size;
+    char name[MAX_NAME];
+};
+
+struct cedge {
+    uint64_t caller;
+    uint64_t callee;
+    uint64_t count;
+};
+
+int load_syms(const char *path, struct sym **out) {
+    if (elf_version(EV_CURRENT) == EV_NONE) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) {
+        close(fd);
+        return -1;
+    }
+
+    size_t n = 0, cap = 0;
+    struct sym *syms = NULL;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(elf, scn)) != NULL) {
+        GElf_Shdr shdr;
+        if (gelf_getshdr(scn, &shdr) == NULL) continue;
+        if (shdr.sh_type != SHT_SYMTAB) continue;
+        Elf_Data *data = elf_getdata(scn, NULL);
+        if (!data) continue;
+        size_t count = shdr.sh_entsize ? shdr.sh_size / shdr.sh_entsize : 0;
+        for (size_t i = 0; i < count; i++) {
+            GElf_Sym sym;
+            if (gelf_getsym(data, (int)i, &sym) == NULL) continue;
+            if (GELF_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+            if (sym.st_value == 0 || sym.st_size == 0) continue;
+            const char *name = elf_strptr(elf, shdr.sh_link, sym.st_name);
+            if (!name || !name[0]) continue;
+            if (n == cap) {
+                cap = cap ? cap * 2 : 1024;
+                struct sym *grown = realloc(syms, cap * sizeof(*syms));
+                if (!grown) {
+                    free(syms);
+                    elf_end(elf);
+                    close(fd);
+                    return -1;
+                }
+                syms = grown;
+            }
+            syms[n].start = sym.st_value;
+            syms[n].size = sym.st_size;
+            strncpy(syms[n].name, name, MAX_NAME - 1);
+            syms[n].name[MAX_NAME - 1] = '\0';
+            n++;
+        }
+    }
+    elf_end(elf);
+    close(fd);
+    *out = syms;
+    return (int)n;
+}
+
+int find_sym(uint64_t off, struct sym *syms, int ns) {
+    int best = -1;
+    uint64_t best_sz = UINT64_MAX;
+    for (int i = 0; i < ns; i++) {
+        if (off >= syms[i].start && off < syms[i].start + syms[i].size &&
+            syms[i].size < best_sz) {
+            best = i;
+            best_sz = syms[i].size;
+        }
+    }
+    return best;
+}
+
+const char *sym_name(uint64_t start, struct sym *syms, int ns, struct map *maps, uint8_t mi) {
+    for (int i = 0; i < ns; i++)
+        if (syms[i].start == start) return syms[i].name;
+    for (uint8_t i = 0; i < mi; i++)
+        if (maps[i].key == start) return maps[i].name;
+    return NULL;
+}
+
+int add_cedge(struct cedge **edges, int *n, int *cap, uint64_t caller, uint64_t callee, uint64_t count) {
+    for (int i = 0; i < *n; i++) {
+        if ((*edges)[i].caller == caller && (*edges)[i].callee == callee) {
+            (*edges)[i].count += count;
+            return 0;
+        }
+    }
+    if (*n == *cap) {
+        int ncap = *cap ? *cap * 2 : 64;
+        struct cedge *grown = realloc(*edges, (size_t)ncap * sizeof(**edges));
+        if (!grown) return -1;
+        *edges = grown;
+        *cap = ncap;
+    }
+    (*edges)[(*n)++] = (struct cedge){ .caller = caller, .callee = callee, .count = count };
+    return 0;
+}
+
+int called_by_other(uint64_t id, struct cedge *edges, int n) {
+    for (int i = 0; i < n; i++)
+        if (edges[i].callee == id && edges[i].caller != id) return 1;
+    return 0;
+}
+
+uint64_t sum_out(uint64_t id, struct cedge *edges, int n) {
+    uint64_t c = 0;
+    for (int i = 0; i < n; i++)
+        if (edges[i].caller == id) c += edges[i].count;
+    return c;
+}
+
+void print_branch(struct cedge *edges, int ne, struct sym *syms, int ns,
+                  struct map *maps, uint8_t mi, uint64_t id, uint64_t count,
+                  int depth, int *is_last, uint64_t *path, int plen) {
+    for (int d = 0; d < depth; d++) {
+        if (d == depth - 1) printf(is_last[d] ? " └── " : " ├── ");
+        else printf(is_last[d] ? "     " : " │   ");
+    }
+    const char *name = sym_name(id, syms, ns, maps, mi);
+    if (name) printf("%s (%llu)\n", name, (unsigned long long)count);
+    else printf("%#" PRIx64 " (%llu)\n", id, (unsigned long long)count);
+
+    for (int i = 0; i < plen; i++)
+        if (path[i] == id) return;
+
+    int nchild = 0;
+    for (int i = 0; i < ne; i++)
+        if (edges[i].caller == id) nchild++;
+
+    path[plen] = id;
+    int seen = 0;
+    for (int i = 0; i < ne; i++) {
+        if (edges[i].caller != id) continue;
+        seen++;
+        is_last[depth] = (seen == nchild);
+        print_branch(edges, ne, syms, ns, maps, mi, edges[i].callee, edges[i].count,
+                     depth + 1, is_last, path, plen + 1);
+    }
+}
+
+void caller_graph(struct map *maps, uint8_t mi) {
+    FILE *fp = fopen(RSTACK, "rb");
+    if (!fp) return;
+
+    uint64_t base;
+    if (fread(&base, sizeof(base), 1, fp) != 1) {
+        fprintf(stderr, "could not read binary base from rstacks.txt\n");
+        fclose(fp);
+        return;
+    }
+
+    struct sym *syms = NULL;
+    int ns = load_syms(BINARY, &syms);
+    if (ns < 0) {
+        fprintf(stderr, "failed to read symbols from %s\n", BINARY);
+        fclose(fp);
+        return;
+    }
+
+    struct cedge *edges = NULL;
+    int ne = 0, cap = 0;
+    struct path_key pk;
+    uint64_t count;
+    while (fread(&pk, sizeof(pk), 1, fp) == 1 && fread(&count, sizeof(count), 1, fp) == 1) {
+        if (pk.leaf < base) continue;
+        uint32_t nframes = pk.nframes;
+        if (nframes > STACK_FRAMES) nframes = STACK_FRAMES;
+
+        uint64_t seq[STACK_FRAMES + 1];
+        int ns_eq = 0;
+        for (uint32_t i = 0; i < nframes; i++) {
+            if (pk.frame[i] < base) break;
+            int s = find_sym(pk.frame[i] - base, syms, ns);
+            if (s < 0) break;
+            seq[ns_eq++] = syms[s].start;
+        }
+
+        uint64_t ordered[STACK_FRAMES + 1];
+        int no = 0;
+        for (int i = ns_eq - 1; i >= 0; i--) ordered[no++] = seq[i];
+
+        uint64_t leaf_off = pk.leaf - base;
+        int ls = find_sym(leaf_off, syms, ns);
+        ordered[no++] = ls >= 0 ? syms[ls].start : leaf_off;
+
+        if (no == 1) {
+            if (add_cedge(&edges, &ne, &cap, 0, ordered[0], count) != 0) {
+                fprintf(stderr, "out of memory building caller graph\n");
+                free(edges);
+                free(syms);
+                fclose(fp);
+                return;
+            }
+        } else {
+            for (int i = 0; i < no - 1; i++) {
+                if (add_cedge(&edges, &ne, &cap, ordered[i], ordered[i + 1], count) != 0) {
+                    fprintf(stderr, "out of memory building caller graph\n");
+                    free(edges);
+                    free(syms);
+                    fclose(fp);
+                    return;
+                }
+            }
+        }
+    }
+    fclose(fp);
+
+    puts("\n----<caller graph>----");
+    uint64_t roots[1024];
+    int nr = 0;
+    for (int i = 0; i < ne; i++) {
+        uint64_t id = edges[i].caller == 0 ? edges[i].callee : edges[i].caller;
+        if (edges[i].caller != 0 && called_by_other(edges[i].caller, edges, ne)) continue;
+        int seen = 0;
+        for (int r = 0; r < nr; r++)
+            if (roots[r] == id) seen = 1;
+        if (seen || nr == 1024) continue;
+        roots[nr++] = id;
+    }
+    int is_last[STACK_FRAMES + 2];
+    uint64_t path[STACK_FRAMES + 2];
+    for (int r = 0; r < nr; r++) {
+        uint64_t count_r = 0;
+        for (int i = 0; i < ne; i++) {
+            if (edges[i].caller == 0 && edges[i].callee == roots[r]) count_r = edges[i].count;
+        }
+        if (count_r == 0) count_r = sum_out(roots[r], edges, ne);
+        puts("");
+        print_branch(edges, ne, syms, ns, maps, mi, roots[r], count_r, 0, is_last, path, 0);
+    }
+
+    free(edges);
+    free(syms);
 }
 
 void print_graph(struct map *maps, uint8_t mi, struct edge *edges, uint32_t ei) {
@@ -198,6 +443,7 @@ int main(int argc, char **argv) {
 
     puts("\n----<function graph>----");
     print_graph(maps, mi, edges, ei);
+    caller_graph(maps, mi);
 
     return 0;
 }
