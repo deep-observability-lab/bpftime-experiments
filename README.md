@@ -5,6 +5,7 @@ This project uses **[bpftime](https://github.com/eunomia-bpf/bpftime)**, a users
 * **count calls** per probed address in a per-CPU hash map,
 * **read packet headers** (Ethernet, IPv4, TCP/UDP ports) from the `struct rte_mbuf` passed as the first argument,
 * **trace conditionally**: only calls whose packet matches a user-supplied 5-tuple filter are counted and reported,
+* **sample** those matches: a `sample_rate` of `N` keeps about one in `N` hits of the first probed function (`0` keeps every match), and a kept hit brings the nested probes under it with it,
 * **stream entry/exit events** to userspace through a **perf event buffer** (`BPF_MAP_TYPE_PERF_EVENT_ARRAY`).
 
 The loader writes the raw results to two binary files. A separate **post-processing tool** (`post`) turns them into per-function call counts, an ENTER/EXIT event trace, and a caller→callee **function graph**.
@@ -31,8 +32,8 @@ The loader writes the raw results to two binary files. A separate **post-process
 bpftime-experiments/
 ├── README.md        # Description of the project (Current file) 
 ├── Makefile         # Builds libbpf, bpftool, the eBPF object, the skeleton, `uprobe` and `post` (set BPFTROOT first)
-├── uprobe.bpf.c     # eBPF programs: do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, per-thread entry/exit pairing, maps
-├── uprobe.c         # libbpf loader: parses the filter args and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes `revents.txt` (clock header + timestamped events) and `rcounts.txt`
+├── uprobe.bpf.c     # eBPF programs: do_uprobe_match / do_uprobe / do_uretprobe, mbuf/packet parsing, 5-tuple filter, probability sampling, per-thread depth, maps
+├── uprobe.c         # libbpf loader: parses the filter args, sample_rate and funcs.conf, finds the testpmd base, attaches probes, polls the perf buffer, writes `revents.txt` (clock header + timestamped events) and `rcounts.txt`
 ├── uprobe.h         # Shared constants: output file names (revents.txt, rcounts.txt), MAX_LINE, FUNC (=32)
 ├── post.c           # Post-processor: decodes rcounts.txt/revents.txt into call counts, a UTC-timestamped ENTER/EXIT trace and function graph
 ├── funcs.conf       # Input: "<function_name> <offset> [<offset> ...]" lines (16 functions, 22 offsets) inside dpdk-testpmd
@@ -231,6 +232,7 @@ All experiments share **one** eBPF object (`uprobe.bpf.c`) and **one** loader (`
 | Counting function calls | **Yes** | `counters` map in `uprobe.bpf.c`, dumped by `uprobe.c`, printed by `post.c` |
 | Packet (header) tracing | **Yes** Headers are parsed and used for filtering| `uprobe.bpf.c` |
 | Conditional tracing | **Yes**, a 5-tuple filter with `0` as a wildcard | `target` map + CLI args of `uprobe` |
+| Probability sampling | **Yes**, keep about `1/N` of the matches of the first probed function (`0` keeps all) | `sthresh` map + `sample_rate` argument of `uprobe` (section 3.10) |
 | uprobe / uretprobe attachment | **Yes** | `do_uprobe` / `do_uretprobe`, `bpf_program__attach_uprobe()` |
 | Ring buffer | **No.** There is no `BPF_MAP_TYPE_RINGBUF` / `ring_buffer__*` anywhere in the code. | — |
 | Perf buffer | **Yes** | `events` map (`BPF_MAP_TYPE_PERF_EVENT_ARRAY`), `perf_buffer__new/poll` |
@@ -325,7 +327,7 @@ else bpf_map_update_elem(&counters, &key, &init, BPF_ANY);
 
 When the loader exits (Ctrl-C / SIGTERM), `uprobe.c` iterates the map with `bpf_map__get_next_key`, sums the per-CPU values, and writes them to `rcounts.txt`. Before the counts, it writes the testpmd load base so that `post` can turn runtime addresses back into file offsets.
 
-> Only **entries** are counted, and only for calls that **pass the packet filter** (section 3.4). A call is counted only if its first argument points to a readable IPv4 `rte_mbuf` that matches the filter. With all-wildcard arguments (`0 0 0 0 0`), this still means "IPv4 packets only".
+> Only **entries** are counted, and only for calls that **pass the packet filter** (section 3.4) and **are kept by the sampler** (section 3.10). The filter and the sampler run on the first offset in `funcs.conf`. With all-wildcard filter arguments (`0 0 0 0 0`) and `sample_rate` `0`, this still means "every IPv4 packet". A `sample_rate` of `N` counts about `1/N` of those hits, plus the nested probes under each kept hit.
 
 ### 3.3 Experiment: packet header tracing (argument tracing)
 
@@ -362,11 +364,13 @@ Ports are read only when `proto` is TCP or UDP.
 
 **Files:** `uprobe.bpf.c` (map `target`), `uprobe.c` (command-line arguments).
 
-**How it works.** The loader takes exactly five arguments and stores them in a one-entry array map named `target`:
+**How it works.** The loader takes exactly six arguments. The first five are the filter, stored in a one-entry array map named `target`. The sixth is `sample_rate` (section 3.10):
 
 ```
-usage: ./uprobe proto src_addr dst_addr src_port dst_port (use 0 as wildcard)
+usage: ./uprobe <proto> <src_addr> <dst_addr> <src_port> <dst_port> <sample_rate>
 ```
+
+(`0` is a wildcard for a filter field, and `0` for `sample_rate` keeps every match. The message printed by `uprobe` glues `<src_port>` and `<dst_port>` together; they are still two separate arguments.)
 
 * `proto`: IP protocol number as a decimal integer (for example `6` = TCP, `17` = UDP, `1` = ICMP)
 * `src_addr` / `dst_addr`: IPv4 dotted-quad, parsed with `inet_pton`, or `0`
@@ -391,17 +395,19 @@ The loader writes the filter into the map with `bpf_map__update_elem(skel->maps.
 
 **File:** `uprobe.c`.
 
-**How it works.** For each offset `i` from `funcs.conf`, the loader creates two links on `/usr/local/bin/dpdk-testpmd`, for any PID (`-1`):
+**How it works.** For each offset from `funcs.conf`, the loader creates two links on `/usr/local/bin/dpdk-testpmd`, for any PID (`-1`). The first offset gets `do_uprobe_match`; every later offset gets `do_uprobe`. Every offset also gets `do_uretprobe`:
 
 ```c
-// counter + entry
-links[2*i]   = bpf_program__attach_uprobe(skel->progs.do_uprobe,    false, -1, BINARY, offs[i]);
-// exit
-links[2*i+1] = bpf_program__attach_uprobe(skel->progs.do_uretprobe, true,  -1, BINARY, offs[i]);
+links[0]     = bpf_program__attach_uprobe(skel->progs.do_uprobe_match, false, -1, BINARY, offs[0]);
+links[1]     = bpf_program__attach_uprobe(skel->progs.do_uretprobe,     true,  -1, BINARY, offs[0]);
+// i >= 1
+links[2*i]   = bpf_program__attach_uprobe(skel->progs.do_uprobe,         false, -1, BINARY, offs[i]);
+links[2*i+1] = bpf_program__attach_uprobe(skel->progs.do_uretprobe,      true,  -1, BINARY, offs[i]);
 ```
 
-* `do_uprobe` (`SEC("uprobe")`) applies the filter, increments the counter and emits an **entry** event with key `IP<<1`.
-* `do_uretprobe` (`SEC("uretprobe")`) does **not** re-read the packet. It checks the per-thread record that do_uprobe left (section 3.8) and emits an **exit** event with key `(IP<<1)|1` only if the matching entry passed the filter. It does not count.
+* `do_uprobe_match` (`SEC("uprobe")`) applies the 5-tuple filter and the sampler (section 3.10). A kept call increments the counter, raises the thread's depth and emits an **entry** event with key `IP<<1`.
+* `do_uprobe` (`SEC("uprobe")`) does not re-read the packet. It counts and emits an entry only while that thread's depth is above zero, which is how a kept hit of the first function pulls the nested probes in with it.
+* `do_uretprobe` (`SEC("uretprobe")`) does **not** re-read the packet. It emits an **exit** event with key `(IP<<1)|1` only while depth is above zero, then lowers the depth. It does not count.
 
 The loader is a normal libbpf program. When it runs under `bpftime load`, bpftime's syscall server intercepts the BPF and perf-event syscalls, and the probes are installed in testpmd's userspace by the bpftime agent instead of the kernel.
 
@@ -431,18 +437,17 @@ bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, ev, sizeof(ev));
 
 **File:** `post.c`. Details are in [section 5](#5-post-processing-and-interpreting-results).
 
-### 3.8 Per-thread entry/exit pairing (`tstates` map)
+### 3.8 Per-thread entry/exit pairing (`depths` map)
 
-**File:** `uprobe.bpf.c` (struct `tstate`, map `tstates`, helper `match()`).
+**File:** `uprobe.bpf.c` (map `depths`).
 
-At return time the first-argument register no longer holds the mbuf, so the exit probe cannot re-run the filter. Instead, every thread keeps a small record, keyed by `bpf_get_current_pid_tgid()`:
+At return time the first-argument register no longer holds the mbuf, so the exit probe cannot re-run the filter. Instead, every thread has a nesting counter in `depths`, a hash map keyed by `bpf_get_current_pid_tgid()` with a `u32` value (`max_entries` is `MAX_DEPTH`, 1024). Entries are never deleted.
 
-`struct tstate { __u32 depth; __u64 bits; }`;
+* **Kept hit of the first function** (`do_uprobe_match`): create the counter at 0 if this thread has none, then add 1, then emit ENTER. A call that fails the filter or the sampler returns before this, so the counter stays unchanged (section 3.10).
+* **Later function** (`do_uprobe`): if the counter is missing or 0, return. Otherwise add 1 and emit ENTER, unless the counter is already above `MAX_DEPTH`.
+* **Exit** (`do_uretprobe`): if the counter is missing, 0, or above `MAX_DEPTH`, return. Otherwise subtract 1 and emit EXIT. Exit events are not counted.
 
-* **Entry:** take `d = depth`, then `depth = d + 1` (always, whether or not the filter passes). Bit `d` of `bits` is set to 1 if `match()` passes and cleared to 0 if it fails.
-* **Exit:** if `depth == 0`, ignore the event. Otherwise `d = depth - 1`, `depth = d`, and emit EXIT only if bit `d` is 1.
-
-Each nesting level has its own bit, so nested probed calls cannot overwrite each other's decisions. Every emitted EXIT now has a matching ENTER on the same thread.
+Depth above zero is the whole record of "this thread is inside a kept call". Nested probes do not store a separate keep/drop bit. Every emitted EXIT comes from a thread whose counter was raised by an earlier ENTER.
 
 ### 3.9 Event timestamps (UTC)
 
@@ -463,6 +468,37 @@ Things to know when reading these times:
 * The timestamp is taken just before the event is sent, not at the function entry. In `do_uprobe_match` the packet filter runs before it, so that ENTER is slightly late.
 * A zero-syscall event path would need a ring buffer (`BPF_MAP_TYPE_RINGBUF`) instead of the perf buffer. That is not implemented.
 
+### 3.10 Probability sampling
+
+**Files:** `uprobe.bpf.c` (map `sthresh`, program `do_uprobe_match`), `uprobe.c` (the sixth argument).
+
+**How it works.** Sampling is a second gate, after the 5-tuple filter, and it runs only in `do_uprobe_match`. That program is attached to the **first offset** in `funcs.conf` (currently `rte_net_get_ptype`). The other offsets use `do_uprobe`, which does not draw its own sample.
+
+`sample_rate` is a decimal integer:
+
+| `sample_rate` | What is kept |
+|---|---|
+| `0` | Every call that passed the filter. The `sthresh` map is left at 0, and a zero threshold disables the check. |
+| `N` ≥ 1 | About `1/N` of those calls. |
+
+For `N` ≥ 1 the loader writes the same threshold into every CPU slot of `sthresh` (`BPF_MAP_TYPE_PERCPU_ARRAY`, one `u32`):
+
+```c
+srray[i] = UINT32_MAX / sr;   // sr is sample_rate
+```
+
+After `match()` succeeds, the probe draws `bpf_get_prandom_u32()` and drops the call when the draw is greater than or equal to that threshold:
+
+```c
+const __u32 *sth = bpf_map_lookup_elem(&sthresh, &zkey);
+if (sth)
+    if (*sth != 0 && bpf_get_prandom_u32() >= *sth) return 0;
+```
+
+`UINT32_MAX / N` divided by 2^32 is just under `1/N` (`N = 1` drops only the single value `UINT32_MAX`, so it keeps essentially everything). A dropped call returns before the counter update, before `depths` is incremented, and before the ENTER event. Because the other probes emit only while that thread's depth is above zero, the nested calls under a dropped hit are omitted too. A kept hit is counted, opens a depth level, and the probes under it are traced in full. Sampling is one draw per hit of the first function, not one draw per nested event.
+
+Counts, the event trace and the function graph are therefore a sample of the filtered traffic. Multiply a count by `N` for a rough estimate of the full population. The estimate has the usual sampling noise, and it is exact only in expectation.
+
 ---
 
 ## 4. How to run
@@ -476,7 +512,7 @@ Run the bpftime and post-processing commands from the project directory, because
 ```
 [terminal 1]  dpdk-testpmd (interactive)       (must be /usr/local/bin/dpdk-testpmd)
 [terminal 2]  vetap.sh                         (TAP interfaces -> namespaces ns1 / ns2)
-[terminal 2]  bpftime load ./uprobe <filter>   (loader + syscall server; finds testpmd via pidof)
+[terminal 2]  bpftime load ./uprobe <filter> <sample_rate>   (loader + syscall server; finds testpmd via pidof)
 [terminal 3]  bpftime attach <testpmd pid>     (injects the agent; probes become active)
 [terminal 4]  iperf3 server in ns2
 [terminal 1]  testpmd> start
@@ -536,20 +572,22 @@ sudo ./vetap.sh               # after: chmod +x vetap.sh   (or: sudo sh vetap.sh
 
 The script creates two network namespaces, each holding one TAP interface. It (re)creates `ns1`, moves `tap0` into it and gives it `10.1.1.1/24`. It does the same for `ns2` with `tap1` and `10.1.1.3/24`. Both interfaces are brought up. Because the addresses are in separate namespaces, iperf3 traffic from ns1 (10.1.1.1) to ns2 (10.1.1.3) cannot take a kernel shortcut. It leaves through `tap0`, is received by testpmd on port 0, is forwarded by the **io** engine (`pkt_burst_io_forward`) to port 1, and arrives on `tap1` in ns2. Replies take the reverse path. Run the script **after** testpmd has started, because the TAP interfaces only exist while testpmd runs. Run it again after every testpmd restart.
 
-**4. Terminal 2: load the eBPF program through bpftime** (in the project directory). `uprobe` takes exactly the five filter arguments `proto src_addr dst_addr src_port dst_port` (`0` = wildcard). It reads `funcs.conf` from the current directory by itself, so **do not pass `funcs.conf` as an argument**: a sixth argument makes `uprobe` print its usage message and exit.
+**4. Terminal 2: load the eBPF program through bpftime** (in the project directory). `uprobe` takes exactly six arguments: the filter `proto src_addr dst_addr src_port dst_port` (`0` = wildcard) and a `sample_rate` (`0` = keep every match, `N` = keep about 1/N; section 3.10). It reads `funcs.conf` from the current directory by itself, so **do not pass `funcs.conf` as an argument**: a seventh argument makes `uprobe` print its usage message and exit.
 
 ```bash
 git clone <project-repo-url> bpftime-experiments   # if you do not have the project source yet
 cd bpftime-experiments        # must contain funcs.conf
-# trace all IPv4 packets (all wildcards)
-sudo -E ~/.bpftime/bpftime load ./uprobe 0 0 0 0 0
+# trace all IPv4 packets (all wildcards, no sampling)
+sudo -E ~/.bpftime/bpftime load ./uprobe 0 0 0 0 0 0
 # or: only TCP packets from ns1 (10.1.1.1) to ns2 (10.1.1.3), any ports
-sudo -E ~/.bpftime/bpftime load ./uprobe 6 10.1.1.1 10.1.1.3 0 0
+sudo -E ~/.bpftime/bpftime load ./uprobe 6 10.1.1.1 10.1.1.3 0 0 0
 # or: only the iperf3 data direction (TCP to the default iperf3 port 5201)
-sudo -E ~/.bpftime/bpftime load ./uprobe 6 10.1.1.1 10.1.1.3 0 5201
+sudo -E ~/.bpftime/bpftime load ./uprobe 6 10.1.1.1 10.1.1.3 0 5201 0
+# or: the same filter, keeping about 1 in 100 hits of the first function
+sudo -E ~/.bpftime/bpftime load ./uprobe 6 10.1.1.1 10.1.1.3 0 5201 100
 ```
 
-> The filter is one-directional. With `src_addr = 10.1.1.1` / `dst_addr = 10.1.1.3`, the replies from 10.1.1.3 (such as TCP ACKs) do not match. Use `0 0 0 0 0` or swap the addresses to see the other direction.
+> The filter is one-directional. With `src_addr = 10.1.1.1` / `dst_addr = 10.1.1.3`, the replies from 10.1.1.3 (such as TCP ACKs) do not match. Use `0 0 0 0 0 0` or swap the addresses to see the other direction. A non-zero `sample_rate` thins the kept hits further; it does not change which 5-tuple matches.
 
 **5. Terminal 3: attach to testpmd:**
 
@@ -599,6 +637,8 @@ The output is large, because every ENTER/EXIT event is printed: about 776k lines
 The outputs below come from a test run of the procedure above. `funcs.conf` was regenerated with `readelf` for that run's testpmd build (section 3.1.1) and listed `rte_net_get_ptype`, `rte_mbuf_raw_alloc`, `rte_pktmbuf_free`, `pmd_rx_burst`, `pmd_tx_burst` and `pkt_burst_io_forward`.
 
 **Run 1: all IPv4 packets** (`./uprobe 0 0 0 0 0`)
+
+The commands in these two runs predate `sample_rate`. The same "keep every match" behavior is now a trailing `0` (`./uprobe 0 0 0 0 0 0` and `./uprobe 6 10.1.1.1 10.1.1.3 0 5201 0`).
 
 iperf3 client summary:
 
@@ -711,8 +751,8 @@ else {                         // is entry, create edge or increment count
 
 ### 5.3 Interpreting the results
 
-* **Counts** are the number of **filtered** entries per probed address, summed over all CPUs. If a function has several offsets (inlined copies), `post` prints one line per offset, all with the same name. Add them up for a per-function total.
-* **Events** are only events that passed the filter. The `cpu` value is the CPU that emitted the event, which tells you which lcore handled the packet.
+* **Counts** are the number of **filtered and sampled** entries per probed address, summed over all CPUs (sections 3.4 and 3.10). If a function has several offsets (inlined copies), `post` prints one line per offset, all with the same name. Add them up for a per-function total. With `sample_rate` `N`, multiply by `N` for a rough estimate of the unsampled count.
+* **Events** are only events that passed the filter and were kept by the sampler. The `cpu` value is the CPU that emitted the event, which tells you which lcore handled the packet.
 * **Timestamps** are comparable across CPUs (same clock) and increase per CPU. The file order is not global time order, because the perf buffer is drained per CPU. Sort on the time column if you need one global timeline. See section 3.9 for the probe overhead that every ENTER/EXIT difference includes.
 * **The graph** is a dynamic call graph limited to the probed functions. An edge `A --[n]--> B` means B was entered n times while A was the innermost traced function still open. The stack is global, not per-CPU or per-thread. With several forwarding lcores, interleaved events from different CPUs can create artificial edges, so use a single forwarding core when you want a clean graph.
 * Functions whose first argument is **not** an `rte_mbuf *` will rarely or never appear (see Limitations). Examples are `rte_lcore_id(void)`, `rte_eth_rx_burst(port_id, ...)`, `pmd_rx_burst(queue, ...)`, `pkt_burst_io_forward(fs)` and `rte_mbuf_raw_alloc(mempool)`.
@@ -725,12 +765,13 @@ else {                         // is entry, create edge or increment count
 
 | Symptom (message printed by the tools) | Likely cause / fix |
 |---|---|
-| `usage: ./uprobe proto src_addr dst_addr src_port dst_port (use 0 as wildcard)` | `uprobe` needs exactly 5 arguments. Use `0 0 0 0 0` for "everything IPv4". |
+| `usage: ./uprobe <proto> <src_addr> <dst_addr> <src_port><dst_port> <sample_rate> (use 0 as wildcard)` | `uprobe` needs exactly 6 arguments. The printed message has no space between `<src_port>` and `<dst_port>`; they are still two arguments. Use `0 0 0 0 0 0` for "every IPv4 packet, no sampling". |
 | `failed to fopen input file` | `funcs.conf` is not in the current directory. Run from the project directory. |
 | `invalid offset '...' in funcs.conf` / `no offsets found in funcs.conf` | Malformed `funcs.conf`. It must be space-separated, with numbers in hex (`0x..`) or decimal. |
 | `pid not found` | testpmd is not running, or its process name is not `dpdk-testpmd`. Start testpmd **before** `uprobe`. |
 | `bin base not found` | testpmd was not started from `/usr/local/bin/dpdk-testpmd`, for example `./build/app/dpdk-testpmd`. Install it with `meson install` or change `BINARY` in `uprobe.c`. |
-| `usage: ...` right after `bpftime load ./uprobe funcs.conf ...` | `funcs.conf` was passed as an argument. `uprobe` reads it from the current directory; pass only the 5 filter arguments. |
+| `usage: ...` right after `bpftime load ./uprobe funcs.conf ...` | `funcs.conf` was passed as an argument. `uprobe` reads it from the current directory; pass only the 5 filter arguments and `sample_rate`. |
+| `failed to pass sample_rate to eBPF` | The loader could not write the per-CPU threshold into `sthresh`. Check the libbpf message on stderr. |
 | `Cannot find device "tap0"` from `vetap.sh` | testpmd is not running (the TAP interfaces exist only while it runs), or `vetap.sh` already moved them into the namespaces. |
 | iperf3 client cannot connect | Forwarding not started (`testpmd> start`), or the namespaces were not recreated after a testpmd restart. Check with `sudo ip netns exec ns1 ping -c 3 10.1.1.3`. |
 | bpftime looks for libraries under `/root/.bpftime` | Run it with `sudo -E` so your `HOME` (and `~/.bpftime`) is kept. |
@@ -748,7 +789,7 @@ else {                         // is entry, create edge or increment count
 ### 6.2 Known limitations
 
 1. **Every probed function is assumed to take `struct rte_mbuf *` as its first argument.** Many functions in `funcs.conf` do not, for example `rte_lcore_id`, `rte_constant_bswap16`, `rte_ipv4_hdr_len`, `rte_mbuf_raw_alloc`, `rte_eth_rx_burst`, `pmd_rx_burst`/`pmd_tx_burst`, `pkt_burst_io_forward` and `common_fwd_stream_transmit`. For those, the mbuf/packet reads fail or read garbage, the call is dropped, and it is **neither counted nor traced**.
-2. **Nesting and thread limits.** Each thread can have at most 64 probed calls open at once (one bit each in tstate.bits). Deeper calls are not traced. The tstates map holds up to 1024 threads, and entries are never removed. That is plenty for testpmd.
+2. **Nesting and thread limits.** `depths` holds at most 1024 threads (`MAX_DEPTH`), and entries are never removed. That is plenty for testpmd. `do_uprobe` and `do_uretprobe` stop once a thread's counter is above 1024, and the exit path does not decrement a counter that high, so that thread then stays silent for the rest of the run (section 3.8).
 3. **Exit address decoding.** `post` assumes that the IP seen in the uretprobe decodes to the same function offset as the entry. With kernel uretprobes, the IP at return is the caller's return address. Under bpftime v0.9.0, the exit-probe address decodes to the same function as the entry; this was verified in a test run.
 4. **Inlined call sites are invisible.** The `funcs.conf` offsets are real `FUNC` symbols (out-of-line LOCAL copies of `static inline` helpers, section 3.1.1), so they have a normal call and return. Calls that the compiler inlined into their caller have no symbol and are never probed, so counts cover only the out-of-line copies you listed.
 5. **Fixed packet layout:** untagged Ethernet + IPv4 with a 20-byte header (no IP options, no VLAN, no IPv6). Ports are read at fixed offsets 34/36. Only the first segment (`buf_addr + data_off`) is parsed.
@@ -762,6 +803,7 @@ else {                         // is entry, create edge or increment count
 13. **Event payload is limited to 12 bytes.** Payloads of 4, 8 and 12 bytes were tested and work. With 16 bytes, `uprobe` hangs on Ctrl-C under bpftime v0.9.0. The cause is unknown: `bpf_perf_event_output` and bpftime's perf buffer have no size check that explains it. Adding fields to the event (for example the pid) needs this limit to be understood first.
 14. **The UTC offset is fixed when the loader starts.** The two clock reads are separate calls (an error of tens of nanoseconds), and a later step of the wall clock (manual change, NTP step) is not reflected in a trace that was already written.
 15. **Timestamps include probe overhead.** Each event costs about 1 us (section 3.9), and the time is taken when the event is sent, not at the function boundary.
+16. **Sampling is one draw on the first function in `funcs.conf`.** Nested probes are kept or dropped with that draw; they are not sampled on their own. `sample_rate` `0` keeps every match. The kept fraction for `N` ≥ 1 is `(UINT32_MAX / N) / 2^32`, just under `1/N`. Counts are of the sample (section 3.10).
 
 ---
 
